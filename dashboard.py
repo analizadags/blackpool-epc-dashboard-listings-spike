@@ -101,27 +101,21 @@ if merge_buildings:
         st.error("BUILDING_ID not available to merge flats. Check your columns.")
         st.stop()
 
-    # base row per building + coordinates
     base = (
         df_f.sort_values(["BASE_ADDRESS","POSTCODE"])
            .groupby("BUILDING_ID", as_index=False)
            .first()[["BUILDING_ID","BASE_ADDRESS","POSTCODE","LAT","LON"]]
            .rename(columns={"BASE_ADDRESS":"ADDRESS"})
     )
-    # counts, worst EPC, rating mix
     counts = df_f.groupby("BUILDING_ID").size().rename("N_UNITS").reset_index()
     worst  = df_f.groupby("BUILDING_ID")["CURRENT_ENERGY_RATING"].apply(worst_epc).rename("WORST_EPC").reset_index()
     mix    = df_f.groupby("BUILDING_ID")["CURRENT_ENERGY_RATING"].apply(epc_mix).rename("RATING_MIX").reset_index()
 
-    df_g = base.merge(counts, on="BUILDING_ID").merge(worst, on="BUILDING_ID").merge(mix, on="BUILDING_ID")
-    # If ≥7 filter is on, apply it at building level
+    df_display = base.merge(counts, on="BUILDING_ID").merge(worst, on="BUILDING_ID").merge(mix, on="BUILDING_ID")
     if seven_plus:
-        df_g = df_g[df_g["N_UNITS"] >= 7]
-
-    df_display = df_g.copy()
+        df_display = df_display[df_display["N_UNITS"] >= 7]
     df_display["__LABEL__"] = df_display.apply(make_label_building, axis=1)
 else:
-    # If ≥7 filter is on but we're not merging, keep only flats in buildings that have ≥7 units
     if seven_plus and "BUILDING_ID" in df_f.columns:
         counts = df_f["BUILDING_ID"].value_counts()
         df_f = df_f[df_f["BUILDING_ID"].isin(counts[counts >= 7].index)]
@@ -145,7 +139,6 @@ with st.container():
         with_coords = df_display[["LAT","LON"]].dropna().shape[0] if {"LAT","LON"}.issubset(df_display.columns) else 0
         st.metric("With coordinates", with_coords)
     with c4:
-        # show worst/most common depending on mode
         if merge_buildings:
             st.metric("Worst EPC (mode)", (df_display["WORST_EPC"].mode().iloc[0] if not df_display.empty else "—"))
         else:
@@ -191,7 +184,7 @@ with st.sidebar:
 # ---------- Tabs ----------
 tab_map, tab_sv, tab_tbl, tab_diag = st.tabs(["🗺️ Map", "📷 Street View", "📋 Table", "🔧 Diagnostics"])
 
-# --- Street View helpers (for the SV tab) ---
+# --- Street View helpers ---
 @st.cache_data(show_spinner=False)
 def streetview_metadata(location_param: str, api_key: str):
     try:
@@ -241,7 +234,6 @@ with tab_map:
     m = folium.Map(location=center, zoom_start=zoom)
     cluster = MarkerCluster().add_to(m)
 
-    # key to highlight selected on map
     sel_key = (selected.get("ADDRESS",""), selected.get("POSTCODE",""))
 
     for _, row in df_display.dropna(subset=["LAT","LON"]).iterrows():
@@ -254,7 +246,6 @@ with tab_map:
             n_units = None
             mix = ""
 
-        # Street View link from pin
         gsv_url = (
             "https://www.google.com/maps/@?api=1&map_action=pano"
             f"&viewpoint={row['LAT']},{row['LON']}"
@@ -270,4 +261,87 @@ with tab_map:
             f"</div>"
         )
 
-        i
+        is_sel = (row.get("ADDRESS",""), row.get("POSTCODE","")) == sel_key
+        if is_sel:
+            folium.CircleMarker([row["LAT"], row["LON"]], radius=10, color="#2b8a3e", fill=True, fill_opacity=0.7).add_to(m)
+
+        folium.Marker(
+            [row["LAT"], row["LON"]],
+            popup=folium.Popup(popup_html, max_width=300),
+            icon=folium.Icon(color=color_for(rating))
+        ).add_to(cluster)
+
+    map_key = f"map_{st.session_state['__SEL_LABEL__']}_{len(df_display)}_{int(merge_buildings)}"
+    st_folium(m, width=1100, height=580, key=map_key)
+
+# --- Street View tab ---
+with tab_sv:
+    st.subheader("Street View")
+    address  = selected.get("ADDRESS","")
+    postcode = "" if pd.isna(selected.get("POSTCODE")) else str(selected.get("POSTCODE"))
+    rating   = selected.get("WORST_EPC","") if merge_buildings else selected.get("CURRENT_ENERGY_RATING","")
+    lat      = selected.get("LAT")
+    lon      = selected.get("LON")
+    st.write(f"**{address} – EPC {rating if rating else '—'}**")
+
+    if api_key:
+        heading = st.slider("Heading (°)", 0, 360, 210, 1)
+        pitch   = st.slider("Pitch (°)",  -90,  90,  10, 1)
+        fov     = st.slider("FOV (°)",     30, 120,  80, 1)
+
+        ok, snap_lat, snap_lon, meta, used_param = find_working_streetview(lat, lon, address, postcode, api_key)
+
+        if ok and (snap_lat is not None and snap_lon is not None):
+            loc_param = f"{snap_lat},{snap_lon}"
+            img_url = (
+                "https://maps.googleapis.com/maps/api/streetview"
+                f"?size=640x400&location={loc_param}"
+                f"&heading={heading}&pitch={pitch}&fov={fov}&source=outdoor&key={api_key}"
+            )
+            gsv_url = (
+                "https://www.google.com/maps/@?api=1&map_action=pano"
+                f"&viewpoint={snap_lat},{snap_lon}&heading={heading}&pitch={pitch}&fov={fov}"
+            )
+
+            try:
+                r = requests.get(img_url, timeout=10)
+                ctype = r.headers.get("Content-Type","")
+                if r.ok and ctype.startswith("image/"):
+                    st.markdown(
+                        f'<a href="{gsv_url}" target="_blank" rel="noopener noreferrer">'
+                        f'<img src="{img_url}" alt="Street View" style="max-width:100%;height:auto;border-radius:6px;" /></a>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.warning("Street View image couldn’t be fetched.")
+                    st.code((r.text or str(r.status_code))[:400], language="text")
+                    st.markdown(f"[Open in Google Maps Street View]({gsv_url})")
+            except Exception as e:
+                st.error(f"Street View fetch failed: {e}")
+                st.markdown(f"[Open in Google Maps Street View]({gsv_url})")
+
+            st.caption(address)
+            date = meta.get("date")
+            if date:
+                st.caption(f"Street View capture date: {date}")
+        else:
+            status = (meta or {}).get("status", "UNKNOWN")
+            msg = {
+                "ZERO_RESULTS": "No Street View found near this point.",
+                "REQUEST_DENIED": "Street View request denied (check API key restrictions).",
+                "OVER_QUERY_LIMIT": "Daily quota exceeded for this API key.",
+                "INVALID_REQUEST": "Invalid Street View request parameters.",
+                "ERROR": "Network or API error while checking Street View.",
+            }.get(status, f"Street View not available (status: {status}).")
+            st.warning(msg)
+            gsv_fallback = (
+                "https://www.google.com/maps/search/?api=1&query="
+                f"{quote_plus(f'{address}, {postcode}, Blackpool, UK')}&layer=c"
+            )
+            st.markdown(f"[Open in Google Maps Street View]({gsv_fallback})")
+    else:
+        gmaps_url = f"https://www.google.com/maps?q={quote_plus(address + ' ' + postcode + ' Blackpool UK')}&layer=c"
+        st.info("Enter your Google API key in the sidebar to show Street View images.")
+        st.markdown(f"[Open Street View for this address]({gmaps_url})")
+
+# --- Table tab ---
