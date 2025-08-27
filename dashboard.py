@@ -13,12 +13,19 @@ st.set_page_config(page_title="Blackpool Low-EPC Flats", layout="wide")
 @st.cache_data
 def load_data():
     df = pd.read_csv("blackpool_low_epc_with_coords.csv")
+    # Normalize columns to UPPER CASE for consistency
     df.columns = df.columns.str.upper()
+
+    # Coerce numeric types if present
     for col in ["LAT", "LON", "TOTAL_FLOOR_AREA"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Parse date (dayfirst=True for UK-style dates)
     if "LODGEMENT_DATE" in df.columns:
-        df["LODGEMENT_DATE"] = pd.to_datetime(df["LODGEMENT_DATE"], errors="coerce", dayfirst=True)
+        df["LODGEMENT_DATE"] = pd.to_datetime(
+            df["LODGEMENT_DATE"], errors="coerce", dayfirst=True
+        )
     return df
 
 df = load_data()
@@ -28,46 +35,71 @@ st.caption("Filters on the left. Use the tabs to switch between Map, Street View
 
 # ---------- Helpers ----------
 def base_address(addr: str) -> str:
+    """
+    Strip out 'Flat 3,' / 'Apartment 5,' prefixes to get a building-level address.
+    """
     s = str(addr).strip()
     s = re.sub(r'^\s*(flat|apartment|apt)\s*\d+[a-zA-Z]?\s*,\s*', '', s, flags=re.IGNORECASE)
     return s.strip()
 
-if {"ADDRESS","POSTCODE"}.issubset(df.columns):
+if {"ADDRESS", "POSTCODE"}.issubset(df.columns):
     df["BASE_ADDRESS"] = df["ADDRESS"].apply(base_address)
     df["BUILDING_ID"]  = (df["BASE_ADDRESS"].fillna("") + " | " + df["POSTCODE"].fillna("")).str.strip()
 else:
-    df["BUILDING_ID"] = ""
+    # Fallbacks to avoid crashes if CSV variant lacks these columns
+    if "ADDRESS" not in df.columns:
+        df["ADDRESS"] = ""
+    if "POSTCODE" not in df.columns:
+        df["POSTCODE"] = ""
+    df["BASE_ADDRESS"] = df["ADDRESS"].apply(base_address)
+    df["BUILDING_ID"]  = (df["BASE_ADDRESS"].fillna("") + " | " + df["POSTCODE"].fillna("")).str.strip()
 
-def color_for(r):
-    return "red" if r == "G" else "orange" if r == "F" else "blue"  # D/E
+def color_for(rating: str) -> str:
+    """Map EPC to folium icon color."""
+    r = str(rating).upper()
+    if r == "G":
+        return "red"
+    if r == "F":
+        return "orange"
+    return "blue"  # D/E/other
 
-def worst_epc(series):
+def worst_epc(series: pd.Series):
+    """Return worst (lowest) EPC among D/E/F/G."""
     order = {"D":1, "E":2, "F":3, "G":4}
-    x = series.map(order).max()
-    rev = {v:k for k,v in order.items()}
+    mapped = series.map(lambda x: order.get(str(x).upper(), None))
+    x = mapped.max(skipna=True)
+    rev = {v: k for k, v in order.items()}
     return rev.get(x, None)
 
-def epc_mix(series):
-    vc = series.value_counts()
+def epc_mix(series: pd.Series) -> str:
+    vc = series.astype(str).str.upper().value_counts()
     return f"D{vc.get('D',0)} E{vc.get('E',0)} F{vc.get('F',0)} G{vc.get('G',0)}"
 
-def make_label_flat(row):
-    addr = str(row.get("ADDRESS",""))
+def make_label_flat(row: pd.Series) -> str:
+    addr = str(row.get("ADDRESS", ""))
     pc   = "" if pd.isna(row.get("POSTCODE")) else str(row.get("POSTCODE"))
-    rtg  = str(row.get("CURRENT_ENERGY_RATING",""))
+    rtg  = str(row.get("CURRENT_ENERGY_RATING", ""))
     return f"{addr}  [{pc}]  – EPC {rtg}"
 
-def make_label_building(row):
-    addr = str(row.get("ADDRESS",""))
-    pc   = "" if pd.isna(row.get("POSTCODE")) else str(row.get("POSTCODE"))
-    worst = str(row.get("WORST_EPC",""))
-    n = int(row.get("N_UNITS", 0))
+def make_label_building(row: pd.Series) -> str:
+    addr  = str(row.get("ADDRESS", ""))
+    pc    = "" if pd.isna(row.get("POSTCODE")) else str(row.get("POSTCODE"))
+    worst = str(row.get("WORST_EPC", ""))
+    n     = int(row.get("N_UNITS", 0))
     return f"{addr}  [{pc}]  – {n} units – worst EPC {worst}"
 
-# ---------- Sidebar filters ----------
+# ---------- Sidebar ----------
 st.sidebar.header("Filters")
-default_key   = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
-api_key       = st.sidebar.text_input("Google API key (for Street View)", value=default_key, type="password")
+
+# Refresh button to reload data (and clear cache)
+if st.sidebar.button("🔄 Refresh data"):
+    st.cache_data.clear()
+    st.rerun()
+
+# Google Maps API key (read from secrets by default)
+default_key = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
+api_key     = st.sidebar.text_input("Google API key (for Street View)", value=default_key, type="password")
+
 flats_only    = st.sidebar.checkbox("Flats only", value=True)
 ratings_only  = st.sidebar.checkbox("Only EPC D–G", value=True)
 seven_plus    = st.sidebar.checkbox("Require ≥7 units per building", value=False)
@@ -82,43 +114,59 @@ else:
     st.sidebar.info("No floor area data available.")
     area_range = None
 
-# NEW: merge mode (default to True when seven_plus is checked)
-merge_buildings = st.sidebar.checkbox("Merge flats into one location (one pin per building)", value=seven_plus)
+# Merge mode (auto-default on when seven_plus is checked)
+merge_buildings = st.sidebar.checkbox(
+    "Merge flats into one location (one pin per building)",
+    value=seven_plus
+)
 
 # ---------- Apply filters at flat level ----------
 df_f = df.copy()
+
 if flats_only and "PROPERTY_TYPE" in df_f.columns:
-    df_f = df_f[df_f["PROPERTY_TYPE"].str.contains("Flat", case=False, na=False)]
+    df_f = df_f[df_f["PROPERTY_TYPE"].astype(str).str.contains("Flat", case=False, na=False)]
+
 if ratings_only and "CURRENT_ENERGY_RATING" in df_f.columns:
-    df_f = df_f[df_f["CURRENT_ENERGY_RATING"].isin(rating_filter)]
+    df_f = df_f[df_f["CURRENT_ENERGY_RATING"].astype(str).str.upper().isin(rating_filter)]
+
 if has_area:
     df_f = df_f[df_f["TOTAL_FLOOR_AREA"].between(area_range[0], area_range[1])]
 
 # ---------- Build display dataframe ----------
 if merge_buildings:
-    # Aggregate to one row per BUILDING_ID
-    if "BUILDING_ID" not in df_f.columns:
-        st.error("BUILDING_ID not available to merge flats. Check your columns.")
-        st.stop()
+    # Ensure the columns we need exist
+    for col in ["BUILDING_ID", "BASE_ADDRESS", "POSTCODE"]:
+        if col not in df_f.columns:
+            st.error(f"Required column '{col}' is missing for merge mode.")
+            st.stop()
 
+    # Base row per building + coords (first non-null)
     base = (
-        df_f.sort_values(["BASE_ADDRESS","POSTCODE"])
-           .groupby("BUILDING_ID", as_index=False)
-           .first()[["BUILDING_ID","BASE_ADDRESS","POSTCODE","LAT","LON"]]
-           .rename(columns={"BASE_ADDRESS":"ADDRESS"})
+        df_f.sort_values(["BASE_ADDRESS", "POSTCODE"])
+            .groupby("BUILDING_ID", as_index=False)
+            .first()[["BUILDING_ID","BASE_ADDRESS","POSTCODE","LAT","LON"]]
+            .rename(columns={"BASE_ADDRESS":"ADDRESS"})
     )
+
+    # Aggregations
     counts = df_f.groupby("BUILDING_ID").size().rename("N_UNITS").reset_index()
     worst  = df_f.groupby("BUILDING_ID")["CURRENT_ENERGY_RATING"].apply(worst_epc).rename("WORST_EPC").reset_index()
     mix    = df_f.groupby("BUILDING_ID")["CURRENT_ENERGY_RATING"].apply(epc_mix).rename("RATING_MIX").reset_index()
 
     df_display = base.merge(counts, on="BUILDING_ID").merge(worst, on="BUILDING_ID").merge(mix, on="BUILDING_ID")
+
+    # Apply ≥7 filter at building level if requested
     if seven_plus:
         df_display = df_display[df_display["N_UNITS"] >= 7]
+
     df_display["__LABEL__"] = df_display.apply(make_label_building, axis=1)
+
 else:
+    # If ≥7 filter is on but we are NOT merging, keep only flats in buildings that have ≥7 units
     if seven_plus and "BUILDING_ID" in df_f.columns:
-        counts = df_f["BUILDING_ID"].value_counts()
-        df_f = df_f[df_f["BUILDING_ID"].isin(counts[counts >= 7].index)]
+        b_counts = df_f["BUILDING_ID"].value_counts()
+        df_f = df_f[df_f["BUILDING_ID"].isin(b_counts[b_counts >= 7].index)]
+
     df_display = df_f.copy()
     df_display["__LABEL__"] = df_display.apply(make_label_flat, axis=1)
 
@@ -136,16 +184,19 @@ with st.container():
         n_bldgs = (df_f["BUILDING_ID"].nunique() if "BUILDING_ID" in df_f.columns else 0)
         st.metric("Unique buildings (in data)", n_bldgs)
     with c3:
-        with_coords = df_display[["LAT","LON"]].dropna().shape[0] if {"LAT","LON"}.issubset(df_display.columns) else 0
+        if {"LAT","LON"}.issubset(df_display.columns):
+            with_coords = df_display[["LAT","LON"]].dropna().shape[0]
+        else:
+            with_coords = 0
         st.metric("With coordinates", with_coords)
     with c4:
-        if merge_buildings:
-            st.metric("Worst EPC (mode)", (df_display["WORST_EPC"].mode().iloc[0] if not df_display.empty else "—"))
+        if merge_buildings and "WORST_EPC" in df_display.columns and not df_display["WORST_EPC"].dropna().empty:
+            st.metric("Worst EPC (mode)", df_display["WORST_EPC"].mode().iloc[0])
+        elif (not merge_buildings) and "CURRENT_ENERGY_RATING" in df_display.columns:
+            rc = df_display["CURRENT_ENERGY_RATING"].value_counts(dropna=False)
+            st.metric("Most common rating", (rc.index[0] if not rc.empty else "—"))
         else:
-            rating_counts = (df_display["CURRENT_ENERGY_RATING"].value_counts(dropna=False)
-                             if "CURRENT_ENERGY_RATING" in df_display.columns else pd.Series(dtype=int))
-            top = rating_counts.index[0] if not rating_counts.empty else "—"
-            st.metric("Most common rating", str(top))
+            st.metric("Most common rating", "—")
 
 # ---------- Stable selection ----------
 if "__SEL_LABEL__" not in st.session_state:
@@ -181,10 +232,7 @@ with st.sidebar:
             f"Building: {selected.get('BUILDING_ID','')}"
         )
 
-# ---------- Tabs ----------
-tab_map, tab_sv, tab_tbl, tab_diag = st.tabs(["🗺️ Map", "📷 Street View", "📋 Table", "🔧 Diagnostics"])
-
-# --- Street View helpers ---
+# ---------- Street View helpers ----------
 @st.cache_data(show_spinner=False)
 def streetview_metadata(location_param: str, api_key: str):
     try:
@@ -200,6 +248,7 @@ def streetview_metadata(location_param: str, api_key: str):
 def find_working_streetview(lat, lon, address, postcode, api_key):
     candidates = []
     if pd.notna(lat) and pd.notna(lon):
+        # Try nearby offsets around the point
         offsets = [
             (0.0, 0.0),
             (0.0003, 0.0), (-0.0003, 0.0), (0.0, 0.0003), (0.0, -0.0003),
@@ -207,6 +256,7 @@ def find_working_streetview(lat, lon, address, postcode, api_key):
         ]
         for dy, dx in offsets:
             candidates.append(f"{lat + dy},{lon + dx}")
+    # Try address as a final fallback
     addr_str = f"{address}, {postcode}, Blackpool, UK"
     candidates.append(addr_str)
 
@@ -221,6 +271,9 @@ def find_working_streetview(lat, lon, address, postcode, api_key):
             return True, snap_lat, snap_lon, meta, loc
     return False, None, None, last_meta or {}, None
 
+# ---------- Tabs ----------
+tab_map, tab_sv, tab_tbl, tab_diag = st.tabs(["🗺️ Map", "📷 Street View", "📋 Table", "🔧 Diagnostics"])
+
 # --- Map tab ---
 with tab_map:
     st.subheader("Map")
@@ -234,6 +287,7 @@ with tab_map:
     m = folium.Map(location=center, zoom_start=zoom)
     cluster = MarkerCluster().add_to(m)
 
+    # highlight selected
     sel_key = (selected.get("ADDRESS",""), selected.get("POSTCODE",""))
 
     for _, row in df_display.dropna(subset=["LAT","LON"]).iterrows():
@@ -246,6 +300,7 @@ with tab_map:
             n_units = None
             mix = ""
 
+        # Street View link from each pin (opens in Google Maps)
         gsv_url = (
             "https://www.google.com/maps/@?api=1&map_action=pano"
             f"&viewpoint={row['LAT']},{row['LON']}"
@@ -263,7 +318,10 @@ with tab_map:
 
         is_sel = (row.get("ADDRESS",""), row.get("POSTCODE","")) == sel_key
         if is_sel:
-            folium.CircleMarker([row["LAT"], row["LON"]], radius=10, color="#2b8a3e", fill=True, fill_opacity=0.7).add_to(m)
+            folium.CircleMarker(
+                [row["LAT"], row["LON"]],
+                radius=10, color="#2b8a3e", fill=True, fill_opacity=0.7
+            ).add_to(m)
 
         folium.Marker(
             [row["LAT"], row["LON"]],
@@ -303,6 +361,7 @@ with tab_sv:
                 f"&viewpoint={snap_lat},{snap_lon}&heading={heading}&pitch={pitch}&fov={fov}"
             )
 
+            # Fetch once so we can surface helpful errors (403/denied/etc.)
             try:
                 r = requests.get(img_url, timeout=10)
                 ctype = r.headers.get("Content-Type","")
@@ -345,3 +404,36 @@ with tab_sv:
         st.markdown(f"[Open Street View for this address]({gmaps_url})")
 
 # --- Table tab ---
+with tab_tbl:
+    st.subheader("Results")
+
+    desired_merge = ["ADDRESS","POSTCODE","N_UNITS","WORST_EPC","RATING_MIX","LAT","LON"]
+    desired_flat  = ["ADDRESS","BASE_ADDRESS","BUILDING_ID","POSTCODE",
+                     "CURRENT_ENERGY_RATING","LODGEMENT_DATE","TOTAL_FLOOR_AREA","LAT","LON"]
+    desired = desired_merge if merge_buildings else desired_flat
+    available = [c for c in desired if c in df_display.columns]
+
+    if not available:
+        st.warning("Expected columns for this mode weren’t found. Showing all columns for debugging.")
+        st.caption("Available columns: " + ", ".join(map(str, df_display.columns)))
+        st.dataframe(df_display, use_container_width=True, height=480)
+        csv_source = df_display
+    else:
+        st.dataframe(df_display[available], use_container_width=True, height=480)
+        csv_source = df_display[available]
+
+    csv_bytes = csv_source.to_csv(index=False).encode("utf-8")
+    st.download_button("Download current view (CSV)", data=csv_bytes,
+                       file_name="blackpool_epc_view.csv", mime="text/csv")
+
+# --- Diagnostics tab ---
+with tab_diag:
+    st.subheader("Diagnostics")
+    st.write("Raw df shape:", df.shape)
+    st.write("Raw df columns:", list(df.columns))
+    st.write("Display df shape:", df_display.shape)
+    st.write("Display df columns:", list(df_display.columns))
+    if {"LAT","LON"}.issubset(df_display.columns):
+        st.write("Entries with coords:", int(df_display[["LAT","LON"]].dropna().shape[0]))
+    st.write("Sample (first 10 rows of display df):")
+    st.dataframe(df_display.head(10), use_container_width=True)
