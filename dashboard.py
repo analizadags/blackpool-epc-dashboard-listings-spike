@@ -13,15 +13,15 @@ st.set_page_config(page_title="Blackpool Low-EPC Flats", layout="wide")
 @st.cache_data
 def load_data():
     df = pd.read_csv("blackpool_low_epc_with_coords.csv")
-    # Normalize columns to UPPER CASE for consistency
+    # Normalize columns
     df.columns = df.columns.str.upper()
 
-    # Coerce numeric types if present
+    # Coerce numeric if present
     for col in ["LAT", "LON", "TOTAL_FLOOR_AREA"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Parse date (dayfirst=True for UK-style dates)
+    # Parse date (UK-style)
     if "LODGEMENT_DATE" in df.columns:
         df["LODGEMENT_DATE"] = pd.to_datetime(
             df["LODGEMENT_DATE"], errors="coerce", dayfirst=True
@@ -35,27 +35,21 @@ st.caption("Filters on the left. Use the tabs to switch between Map, Street View
 
 # ---------- Helpers ----------
 def base_address(addr: str) -> str:
-    """
-    Strip out 'Flat 3,' / 'Apartment 5,' prefixes to get a building-level address.
-    """
+    """Strip 'Flat 3,' / 'Apartment 5,' prefixes to get building-level address."""
     s = str(addr).strip()
     s = re.sub(r'^\s*(flat|apartment|apt)\s*\d+[a-zA-Z]?\s*,\s*', '', s, flags=re.IGNORECASE)
     return s.strip()
 
-if {"ADDRESS", "POSTCODE"}.issubset(df.columns):
-    df["BASE_ADDRESS"] = df["ADDRESS"].apply(base_address)
-    df["BUILDING_ID"]  = (df["BASE_ADDRESS"].fillna("") + " | " + df["POSTCODE"].fillna("")).str.strip()
-else:
-    # Fallbacks to avoid crashes if CSV variant lacks these columns
-    if "ADDRESS" not in df.columns:
-        df["ADDRESS"] = ""
-    if "POSTCODE" not in df.columns:
-        df["POSTCODE"] = ""
-    df["BASE_ADDRESS"] = df["ADDRESS"].apply(base_address)
-    df["BUILDING_ID"]  = (df["BASE_ADDRESS"].fillna("") + " | " + df["POSTCODE"].fillna("")).str.strip()
+# Ensure address columns exist and build BUILDING_ID
+if "ADDRESS" not in df.columns:
+    df["ADDRESS"] = ""
+if "POSTCODE" not in df.columns:
+    df["POSTCODE"] = ""
+
+df["BASE_ADDRESS"] = df["ADDRESS"].apply(base_address)
+df["BUILDING_ID"]  = (df["BASE_ADDRESS"].fillna("") + " | " + df["POSTCODE"].fillna("")).str.strip()
 
 def color_for(rating: str) -> str:
-    """Map EPC to folium icon color."""
     r = str(rating).upper()
     if r == "G":
         return "red"
@@ -64,9 +58,8 @@ def color_for(rating: str) -> str:
     return "blue"  # D/E/other
 
 def worst_epc(series: pd.Series):
-    """Return worst (lowest) EPC among D/E/F/G."""
     order = {"D":1, "E":2, "F":3, "G":4}
-    mapped = series.map(lambda x: order.get(str(x).upper(), None))
+    mapped = series.astype(str).str.upper().map(order)
     x = mapped.max(skipna=True)
     rev = {v: k for k, v in order.items()}
     return rev.get(x, None)
@@ -114,7 +107,7 @@ else:
     st.sidebar.info("No floor area data available.")
     area_range = None
 
-# Merge mode (auto-default on when seven_plus is checked)
+# Merge mode (auto-on if seven_plus)
 merge_buildings = st.sidebar.checkbox(
     "Merge flats into one location (one pin per building)",
     value=seven_plus
@@ -134,12 +127,6 @@ if has_area:
 
 # ---------- Build display dataframe ----------
 if merge_buildings:
-    # Ensure the columns we need exist
-    for col in ["BUILDING_ID", "BASE_ADDRESS", "POSTCODE"]:
-        if col not in df_f.columns:
-            st.error(f"Required column '{col}' is missing for merge mode.")
-            st.stop()
-
     # Base row per building + coords (first non-null)
     base = (
         df_f.sort_values(["BASE_ADDRESS", "POSTCODE"])
@@ -162,7 +149,7 @@ if merge_buildings:
     df_display["__LABEL__"] = df_display.apply(make_label_building, axis=1)
 
 else:
-    # If ≥7 filter is on but we are NOT merging, keep only flats in buildings that have ≥7 units
+    # If ≥7 filter is on but not merging, keep only flats in buildings that have ≥7 units
     if seven_plus and "BUILDING_ID" in df_f.columns:
         b_counts = df_f["BUILDING_ID"].value_counts()
         df_f = df_f[df_f["BUILDING_ID"].isin(b_counts[b_counts >= 7].index)]
@@ -184,10 +171,7 @@ with st.container():
         n_bldgs = (df_f["BUILDING_ID"].nunique() if "BUILDING_ID" in df_f.columns else 0)
         st.metric("Unique buildings (in data)", n_bldgs)
     with c3:
-        if {"LAT","LON"}.issubset(df_display.columns):
-            with_coords = df_display[["LAT","LON"]].dropna().shape[0]
-        else:
-            with_coords = 0
+        with_coords = df_display[["LAT","LON"]].dropna().shape[0] if {"LAT","LON"}.issubset(df_display.columns) else 0
         st.metric("With coordinates", with_coords)
     with c4:
         if merge_buildings and "WORST_EPC" in df_display.columns and not df_display["WORST_EPC"].dropna().empty:
@@ -232,9 +216,10 @@ with st.sidebar:
             f"Building: {selected.get('BUILDING_ID','')}"
         )
 
-# ---------- Street View helpers ----------
+# ---------- Street View helpers (FRESHEST PANO) ----------
 @st.cache_data(show_spinner=False)
 def streetview_metadata(location_param: str, api_key: str):
+    """Call Street View metadata for a location string or 'lat,lon'."""
     try:
         resp = requests.get(
             "https://maps.googleapis.com/maps/api/streetview/metadata",
@@ -245,31 +230,57 @@ def streetview_metadata(location_param: str, api_key: str):
     except Exception as e:
         return {"status": "ERROR", "error_message": str(e)}
 
-def find_working_streetview(lat, lon, address, postcode, api_key):
+def _parse_sv_date(s):
+    """Accept 'YYYY-MM' or 'YYYY' and convert to sortable (year, month)."""
+    try:
+        if not s:
+            return (0, 0)
+        parts = str(s).split("-")
+        year = int(parts[0]) if parts[0].isdigit() else 0
+        month = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        return (year, month)
+    except Exception:
+        return (0, 0)
+
+def find_freshest_streetview(lat, lon, address, postcode, api_key):
+    """
+    Scan a small grid around the point + the textual address, collect all OK panoramas,
+    then pick the one with the newest 'date'. Return its pano_id so we can lock to it.
+    """
     candidates = []
     if pd.notna(lat) and pd.notna(lon):
-        # Try nearby offsets around the point
-        offsets = [
-            (0.0, 0.0),
-            (0.0003, 0.0), (-0.0003, 0.0), (0.0, 0.0003), (0.0, -0.0003),
-            (0.0003, 0.0003), (0.0003, -0.0003), (-0.0003, 0.0003), (-0.0003, -0.0003),
-        ]
-        for dy, dx in offsets:
-            candidates.append(f"{lat + dy},{lon + dx}")
-    # Try address as a final fallback
-    addr_str = f"{address}, {postcode}, Blackpool, UK"
-    candidates.append(addr_str)
+        # ~11 m per 1e-4 deg around Blackpool. Scan up to ~33 m in 8 directions.
+        steps = [0.0, 0.00010, 0.00020, 0.00030]
+        dirs = [(0,0), (1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
+        for d in steps:
+            for sy, sx in dirs:
+                y = lat + sy * d
+                x = lon + sx * d
+                candidates.append(f"{y},{x}")
 
-    last_meta = None
-    for loc in candidates:
+    # Also try address text (sometimes snaps to the better pano)
+    candidates.append(f"{address}, {postcode}, Blackpool, UK")
+
+    best_key = None       # (year, month)
+    best_meta = None      # metadata dict
+    best_used = None      # which candidate string won
+
+    # Metadata requests are low-cost; scanning is safe
+    for loc in dict.fromkeys(candidates):  # dedupe while preserving order
         meta = streetview_metadata(loc, api_key)
-        last_meta = meta
         if meta.get("status") == "OK":
-            loc_meta = meta.get("location", {}) or {}
-            snap_lat = loc_meta.get("lat", lat if pd.notna(lat) else None)
-            snap_lon = loc_meta.get("lng", lon if pd.notna(lon) else None)
-            return True, snap_lat, snap_lon, meta, loc
-    return False, None, None, last_meta or {}, None
+            dkey = _parse_sv_date(meta.get("date"))
+            if (best_key is None) or (dkey > best_key):
+                best_key, best_meta, best_used = dkey, meta, loc
+
+    if best_meta:
+        loc_meta = best_meta.get("location", {}) or {}
+        snap_lat = loc_meta.get("lat", lat if pd.notna(lat) else None)
+        snap_lon = loc_meta.get("lng", lon if pd.notna(lon) else None)
+        pano_id  = best_meta.get("pano_id")
+        return True, snap_lat, snap_lon, best_meta, best_used, pano_id
+
+    return False, None, None, {}, None, None
 
 # ---------- Tabs ----------
 tab_map, tab_sv, tab_tbl, tab_diag = st.tabs(["🗺️ Map", "📷 Street View", "📋 Table", "🔧 Diagnostics"])
@@ -332,7 +343,7 @@ with tab_map:
     map_key = f"map_{st.session_state['__SEL_LABEL__']}_{len(df_display)}_{int(merge_buildings)}"
     st_folium(m, width=1100, height=580, key=map_key)
 
-# --- Street View tab ---
+# --- Street View tab (uses freshest pano) ---
 with tab_sv:
     st.subheader("Street View")
     address  = selected.get("ADDRESS","")
@@ -343,22 +354,35 @@ with tab_sv:
     st.write(f"**{address} – EPC {rating if rating else '—'}**")
 
     if api_key:
+        # Sliders (we'll only change the view, not the chosen pano)
         heading = st.slider("Heading (°)", 0, 360, 210, 1)
         pitch   = st.slider("Pitch (°)",  -90,  90,  10, 1)
         fov     = st.slider("FOV (°)",     30, 120,  80, 1)
 
-        ok, snap_lat, snap_lon, meta, used_param = find_working_streetview(lat, lon, address, postcode, api_key)
+        ok, snap_lat, snap_lon, meta, used_param, pano_id = find_freshest_streetview(
+            lat, lon, address, postcode, api_key
+        )
 
-        if ok and (snap_lat is not None and snap_lon is not None):
-            loc_param = f"{snap_lat},{snap_lon}"
-            img_url = (
-                "https://maps.googleapis.com/maps/api/streetview"
-                f"?size=640x400&location={loc_param}"
-                f"&heading={heading}&pitch={pitch}&fov={fov}&source=outdoor&key={api_key}"
-            )
+        if ok:
+            if pano_id:
+                # Request the exact pano by ID so the date matches what we chose
+                img_url = (
+                    "https://maps.googleapis.com/maps/api/streetview"
+                    f"?size=640x400&pano={pano_id}"
+                    f"&heading={heading}&pitch={pitch}&fov={fov}&source=outdoor&key={api_key}"
+                )
+            else:
+                # Fallback if pano_id missing (rare): use snapped coordinates
+                loc_param = f"{snap_lat},{snap_lon}"
+                img_url = (
+                    "https://maps.googleapis.com/maps/api/streetview"
+                    f"?size=640x400&location={loc_param}"
+                    f"&heading={heading}&pitch={pitch}&fov={fov}&source=outdoor&key={api_key}"
+                )
+
             gsv_url = (
                 "https://www.google.com/maps/@?api=1&map_action=pano"
-                f"&viewpoint={snap_lat},{snap_lon}&heading={heading}&pitch={pitch}&fov={fov}"
+                f"&viewpoint={snap_lat},{snap_lon}"
             )
 
             # Fetch once so we can surface helpful errors (403/denied/etc.)
@@ -380,9 +404,15 @@ with tab_sv:
                 st.markdown(f"[Open in Google Maps Street View]({gsv_url})")
 
             st.caption(address)
-            date = meta.get("date")
-            if date:
-                st.caption(f"Street View capture date: {date}")
+            if meta.get("date"):
+                st.caption(f"Street View capture date: {meta.get('date')} (freshest nearby)")
+
+            with st.expander("Street View Debug"):
+                st.write("Chosen candidate:", used_param)
+                st.write("Pano ID:", pano_id)
+                st.write("Metadata status:", meta.get("status"))
+                st.code(img_url, language="text")
+
         else:
             status = (meta or {}).get("status", "UNKNOWN")
             msg = {
@@ -403,7 +433,7 @@ with tab_sv:
         st.info("Enter your Google API key in the sidebar to show Street View images.")
         st.markdown(f"[Open Street View for this address]({gmaps_url})")
 
-# --- Table tab ---
+# --- Table tab (robust) ---
 with tab_tbl:
     st.subheader("Results")
 
@@ -426,7 +456,7 @@ with tab_tbl:
     st.download_button("Download current view (CSV)", data=csv_bytes,
                        file_name="blackpool_epc_view.csv", mime="text/csv")
 
-# --- Diagnostics tab ---
+# --- Diagnostics tab (robust) ---
 with tab_diag:
     st.subheader("Diagnostics")
     st.write("Raw df shape:", df.shape)
