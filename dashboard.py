@@ -91,7 +91,7 @@ if st.sidebar.button("🔄 Refresh data"):
 
 # Google Maps API key (read from secrets by default)
 default_key = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
-api_key     = st.sidebar.text_input("Google API key (for Street View)", value=default_key, type="password")
+api_key     = st.sidebar.text_input("Google API key (for Street View & optional geocoding)", value=default_key, type="password")
 
 flats_only    = st.sidebar.checkbox("Flats only", value=True)
 ratings_only  = st.sidebar.checkbox("Only EPC D–G", value=True)
@@ -197,6 +197,32 @@ sel_label = st.selectbox(
 st.session_state["__SEL_LABEL__"] = sel_label
 selected = df_display[df_display["__LABEL__"] == st.session_state["__SEL_LABEL__"]].iloc[0].to_dict()
 
+# ---------- Optional: address-accurate link for the selected item (place_id) ----------
+@st.cache_data(show_spinner=False)
+def geocode_place_id(addr_str: str, api_key: str):
+    """Geocode to get a place_id for a more exact Google Maps link."""
+    try:
+        r = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": addr_str, "key": api_key},
+            timeout=8,
+        )
+        js = r.json()
+        if js.get("status") == "OK" and js.get("results"):
+            res = js["results"][0]
+            return res.get("place_id"), res.get("geometry", {}).get("location", {})
+    except Exception:
+        pass
+    return None, {}
+
+addr_str_sel = f"{selected.get('ADDRESS','')}, {selected.get('POSTCODE','')}, Blackpool, UK"
+place_id_sel, geom_sel = geocode_place_id(addr_str_sel, api_key) if api_key else (None, {})
+addr_q_sel = quote_plus(addr_str_sel)
+if place_id_sel:
+    sel_gmaps_link = f"https://www.google.com/maps/search/?api=1&query={addr_q_sel}&query_place_id={place_id_sel}&layer=c"
+else:
+    sel_gmaps_link = f"https://www.google.com/maps/search/?api=1&query={addr_q_sel}&layer=c"
+
 # Quick details in sidebar
 with st.sidebar:
     st.markdown("### Selected")
@@ -215,6 +241,7 @@ with st.sidebar:
             f"EPC: {selected.get('CURRENT_ENERGY_RATING','')}\n\n"
             f"Building: {selected.get('BUILDING_ID','')}"
         )
+    st.markdown(f"[Open in Google Maps (address-accurate)]({sel_gmaps_link})")
 
 # ---------- Street View helpers (FRESHEST PANO) ----------
 @st.cache_data(show_spinner=False)
@@ -311,16 +338,25 @@ with tab_map:
             n_units = None
             mix = ""
 
-        # Street View link from each pin (opens in Google Maps)
-        gsv_url = (
-            "https://www.google.com/maps/@?api=1&map_action=pano"
-            f"&viewpoint={row['LAT']},{row['LON']}"
-        )
+        # ---- Address-accurate Street View link (behaves like manual search) ----
+        addr = str(row.get("ADDRESS",""))
+        pc   = str(row.get("POSTCODE","")) if pd.notna(row.get("POSTCODE")) else ""
+        addr_q = quote_plus(f"{addr}, {pc}, Blackpool, UK")
+
+        # Search link with Street View layer on
+        gsv_url = f"https://www.google.com/maps/search/?api=1&query={addr_q}&layer=c"
+
+        # Fallback to coords if address missing
+        if not addr.strip():
+            gsv_url = (
+                "https://www.google.com/maps/@?api=1&map_action=pano"
+                f"&viewpoint={row['LAT']},{row['LON']}"
+            )
 
         popup_html = (
             f"<div style='font-size:14px; line-height:1.2;'>"
-            f"<strong>{row.get('ADDRESS','(no address)')}</strong><br>"
-            f"Postcode: {row.get('POSTCODE','')}<br>"
+            f"<strong>{addr or '(no address)'} </strong><br>"
+            f"Postcode: {pc}<br>"
             + (f"Units: {n_units}<br>" if merge_buildings else "")
             + (f"Mix: {mix}<br>" if merge_buildings else f"EPC: {rating}<br>")
             + f"<br><a href='{gsv_url}' target='_blank' rel='noopener noreferrer'>🧭 Open Street View</a>"
