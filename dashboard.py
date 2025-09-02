@@ -14,8 +14,7 @@ st.set_page_config(page_title="Blackpool Low-EPC Flats", layout="wide")
 # =========================================
 @st.cache_data
 def _load_builtin():
-    df = pd.read_csv("blackpool_low_epc_with_coords.csv")
-    return df
+    return pd.read_csv("blackpool_low_epc_with_coords.csv")
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -43,10 +42,6 @@ def _ensure_building_fields(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _apply_column_mapping(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    """
-    Map arbitrary CSV columns to the app's expected names without losing data.
-    mapping keys: address, postcode, lat, lon, rating, property_type, total_floor_area, lodgement_date
-    """
     df = df.copy()
     up = {c.upper(): c for c in df.columns}
     def pick(key):
@@ -71,8 +66,7 @@ def _apply_column_mapping(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     if col_tfa:        df["TOTAL_FLOOR_AREA"] = pd.to_numeric(df[col_tfa], errors="coerce")
     if col_lodge_date: df["LODGEMENT_DATE"] = pd.to_datetime(df[col_lodge_date], errors="coerce", dayfirst=True)
 
-    df = _ensure_building_fields(df)
-    return df
+    return _ensure_building_fields(df)
 
 def load_dataframe():
     st.sidebar.subheader("Data source")
@@ -80,38 +74,29 @@ def load_dataframe():
     if uploaded is not None:
         raw = pd.read_csv(uploaded)
         df_up = _normalize_columns(raw)
-
         with st.sidebar.expander("Column mapping", expanded=True):
             cols = [""] + list(df_up.columns)
-
-            st.caption("Map your CSV columns to fields used by the app:")
             c1, c2 = st.columns(2)
             with c1:
-                addr = st.selectbox("Address", options=cols, index=(cols.index("ADDRESS") if "ADDRESS" in cols else 0), key="map_addr")
-                pcd  = st.selectbox("Postcode", options=cols, index=(cols.index("POSTCODE") if "POSTCODE" in cols else 0), key="map_pcd")
-                lat  = st.selectbox("Latitude", options=cols, index=(cols.index("LAT") if "LAT" in cols else 0), key="map_lat")
-                lon  = st.selectbox("Longitude", options=cols, index=(cols.index("LON") if "LON" in cols else 0), key="map_lon")
+                addr = st.selectbox("Address", cols, index=(cols.index("ADDRESS") if "ADDRESS" in cols else 0))
+                pcd  = st.selectbox("Postcode", cols, index=(cols.index("POSTCODE") if "POSTCODE" in cols else 0))
+                lat  = st.selectbox("Latitude", cols, index=(cols.index("LAT") if "LAT" in cols else 0))
+                lon  = st.selectbox("Longitude", cols, index=(cols.index("LON") if "LON" in cols else 0))
             with c2:
-                rat  = st.selectbox("EPC Rating", options=cols, index=(cols.index("CURRENT_ENERGY_RATING") if "CURRENT_ENERGY_RATING" in cols else 0), key="map_rat")
-                pty  = st.selectbox("Property Type", options=cols, index=(cols.index("PROPERTY_TYPE") if "PROPERTY_TYPE" in cols else 0), key="map_pty")
-                tfa  = st.selectbox("Total floor area", options=cols, index=(cols.index("TOTAL_FLOOR_AREA") if "TOTAL_FLOOR_AREA" in cols else 0), key="map_tfa")
-                lodg = st.selectbox("Lodgement date", options=cols, index=(cols.index("LODGEMENT_DATE") if "LODGEMENT_DATE" in cols else 0), key="map_ldg")
-
-        mapping = dict(
-            address=addr or "", postcode=pcd or "", lat=lat or "", lon=lon or "",
-            rating=rat or "", property_type=pty or "", total_floor_area=tfa or "", lodgement_date=lodg or "",
-        )
-        df = _apply_column_mapping(df_up, mapping)
+                rat  = st.selectbox("EPC Rating", cols, index=(cols.index("CURRENT_ENERGY_RATING") if "CURRENT_ENERGY_RATING" in cols else 0))
+                pty  = st.selectbox("Property Type", cols, index=(cols.index("PROPERTY_TYPE") if "PROPERTY_TYPE" in cols else 0))
+                tfa  = st.selectbox("Total floor area", cols, index=(cols.index("TOTAL_FLOOR_AREA") if "TOTAL_FLOOR_AREA" in cols else 0))
+                lodg = st.selectbox("Lodgement date", cols, index=(cols.index("LODGEMENT_DATE") if "LODGEMENT_DATE" in cols else 0))
+        mapping = dict(address=addr, postcode=pcd, lat=lat, lon=lon, rating=rat,
+                       property_type=pty, total_floor_area=tfa, lodgement_date=lodg)
+        return _apply_column_mapping(_normalize_columns(df_up), mapping)
     else:
-        df = _normalize_columns(_load_builtin())
-        df = _ensure_building_fields(df)
-    return df
+        return _ensure_building_fields(_normalize_columns(_load_builtin()))
 
-# load data (uploaded or bundled)
 df = load_dataframe()
 
 st.title("🏢 Blackpool Low-EPC Dashboard")
-st.caption("Upload a CSV to work with your own data, or use the bundled dataset. Filters, map and Street View apply to whichever dataset is active.")
+st.caption("Upload a CSV or use the bundled dataset. Filters apply to whichever dataset is active.")
 
 # =========================================
 # Helpers
@@ -120,7 +105,7 @@ def color_for(rating: str) -> str:
     r = str(rating).upper()
     if r == "G": return "red"
     if r == "F": return "orange"
-    return "blue"  # D/E/other
+    return "blue"
 
 def worst_epc(series: pd.Series):
     order = {"D":1, "E":2, "F":3, "G":4}
@@ -147,7 +132,7 @@ def make_label_building(row: pd.Series) -> str:
     return f"{addr}  [{pc}]  – {n} units – worst EPC {worst}"
 
 # =========================================
-# Sidebar filters (with building-level label filter)
+# Sidebar filters (plus new Display mode + spiderfy)
 # =========================================
 st.sidebar.header("Filters")
 
@@ -158,15 +143,22 @@ if st.sidebar.button("🔄 Refresh data"):
 default_key = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
 api_key = st.sidebar.text_input("Google API key (Street View & optional Geocoding)", value=default_key, type="password")
 
+# Display mode (NEW) – explicit, so you can always see individual flats
+display_mode = st.sidebar.radio(
+    "Display mode",
+    ["Individual flats", "Merged buildings (one pin per building)"],
+    index=0
+)
+merge_buildings = display_mode.startswith("Merged")
+
+# Your usual filters
 flats_only    = st.sidebar.checkbox("Flats only", value=True)
 ratings_only  = st.sidebar.checkbox("Only EPC D–G", value=True)
 rating_filter = st.sidebar.multiselect("EPC Ratings (flat-level)", ["D","E","F","G"], default=["D","E","F","G"])
 
-# Address / postcode filters
 addr_contains = st.sidebar.text_input("Address contains", value="")
 pc_prefix     = st.sidebar.text_input("Postcode starts with", value="")
 
-# Area filter (if present)
 has_area = ("TOTAL_FLOOR_AREA" in df.columns) and df["TOTAL_FLOOR_AREA"].notna().any()
 if has_area:
     valid = df["TOTAL_FLOOR_AREA"].dropna()
@@ -175,7 +167,6 @@ if has_area:
 else:
     area_range = None
 
-# Date filter (if present)
 if "LODGEMENT_DATE" in df.columns and df["LODGEMENT_DATE"].notna().any():
     min_d = pd.to_datetime(df["LODGEMENT_DATE"]).min()
     max_d = pd.to_datetime(df["LODGEMENT_DATE"]).max()
@@ -183,26 +174,21 @@ if "LODGEMENT_DATE" in df.columns and df["LODGEMENT_DATE"].notna().any():
 else:
     d_from = d_to = None
 
-# Units threshold & merge toggle
-min_units = st.sidebar.number_input("Minimum units per building", min_value=0, max_value=999, value=0, step=1)
-merge_buildings = st.sidebar.checkbox("Merge flats into one location (one pin per building)", value=(min_units >= 7))
+# Min units now applies **only in merged mode** (NEW)
+min_units = st.sidebar.number_input(
+    "Minimum units per building (applies in merged mode)", min_value=0, max_value=999, value=0, step=1
+)
 
-# NEW: Building-level label filter (shown only in merge mode)
+# Building-level label filter (only when merging)
 building_label_filter = ["D","E","F","G"]
 building_filter_mode = "Any unit has…"
 if merge_buildings:
     st.sidebar.markdown("**Building label filter**")
     building_label_filter = st.sidebar.multiselect(
-        "Choose building labels to show",
-        ["D","E","F","G"],
-        default=["D","E","F","G"],
-        key="bldg_labels"
+        "Choose building labels to show", ["D","E","F","G"], default=["D","E","F","G"]
     )
     building_filter_mode = st.sidebar.radio(
-        "How should buildings match?",
-        ["Any unit has…", "Worst EPC is…"],
-        index=0,
-        key="bldg_mode"
+        "How should buildings match?", ["Any unit has…", "Worst EPC is…"], index=0
     )
 
 # =========================================
@@ -245,12 +231,9 @@ if merge_buildings:
 
     df_display = base.merge(counts, on="BUILDING_ID").merge(worst, on="BUILDING_ID").merge(mix, on="BUILDING_ID")
 
-    # Apply ≥ min units
     if min_units > 0:
         df_display = df_display[df_display["N_UNITS"] >= int(min_units)]
 
-    # NEW: Building label filter (operates on the CURRENTLY filtered flat-level set df_f)
-    # Tip: This composes with your flat-level "EPC Ratings" selection.
     if set(building_label_filter) != {"D","E","F","G"}:
         selected_set = set([s.upper() for s in building_label_filter])
         if building_filter_mode.startswith("Worst"):
@@ -265,10 +248,7 @@ if merge_buildings:
     df_display["__LABEL__"] = df_display.apply(make_label_building, axis=1)
 
 else:
-    # If min_units is set but not merging, keep flats only from buildings meeting threshold
-    if min_units > 0 and "BUILDING_ID" in df_f.columns:
-        b_counts = df_f["BUILDING_ID"].value_counts()
-        df_f = df_f[df_f["BUILDING_ID"].isin(b_counts[b_counts >= int(min_units)].index)]
+    # FLAT MODE: show every matching flat (no min_units filter here)
     df_display = df_f.copy()
     df_display["__LABEL__"] = df_display.apply(make_label_flat, axis=1)
 
@@ -336,7 +316,7 @@ def geocode_place_id(addr_str: str, api_key: str):
     return None, {}
 
 addr_str_sel = f"{selected.get('ADDRESS','')}, {selected.get('POSTCODE','')}, Blackpool, UK"
-place_id_sel, geom_sel = geocode_place_id(addr_str_sel, api_key) if api_key else (None, {})
+place_id_sel, _ = geocode_place_id(addr_str_sel, api_key) if api_key else (None, {})
 addr_q_sel = quote_plus(addr_str_sel)
 if place_id_sel:
     sel_gmaps_link = f"https://www.google.com/maps/search/?api=1&query={addr_q_sel}&query_place_id={place_id_sel}&layer=c"
@@ -435,7 +415,18 @@ with tab_map:
         center, zoom = [53.8175, -3.05], 12
 
     m = folium.Map(location=center, zoom_start=zoom)
-    cluster = MarkerCluster().add_to(m)
+    # NEW: spiderfy overlapping markers and stop clustering at high zoom
+    cluster = MarkerCluster(
+        options={
+            "spiderfyOnMaxZoom": True,
+            "showCoverageOnHover": False,
+            "zoomToBoundsOnClick": True,
+            "disableClusteringAtZoom": 19
+        }
+    ).add_to(m)
+
+    # Count rows without coords (to explain missing pins)
+    missing_coords = df_display[["LAT","LON"]].isna().any(axis=1).sum()
 
     sel_key = (selected.get("ADDRESS",""), selected.get("POSTCODE",""))
 
@@ -449,7 +440,6 @@ with tab_map:
             n_units = None
             mix = ""
 
-        # Address-accurate Street View link (like manual search)
         addr = str(row.get("ADDRESS",""))
         pc   = str(row.get("POSTCODE","")) if pd.notna(row.get("POSTCODE")) else ""
         addr_q = quote_plus(f"{addr}, {pc}, Blackpool, UK")
@@ -482,6 +472,9 @@ with tab_map:
 
     map_key = f"map_{st.session_state['__SEL_LABEL__']}_{len(df_display)}_{int(merge_buildings)}"
     st_folium(m, width=1100, height=580, key=map_key)
+
+    if missing_coords:
+        st.caption(f"Note: {missing_coords} row(s) have no coordinates, so they are not shown on the map.")
 
 # --- Street View tab (freshest pano) ---
 with tab_sv:
@@ -567,10 +560,9 @@ with tab_sv:
         st.info("Enter your Google API key in the sidebar to show Street View images.")
         st.markdown(f"[Open Street View for this address]({gmaps_url})")
 
-# --- Table tab (robust) ---
+# --- Table tab ---
 with tab_tbl:
     st.subheader("Results")
-
     desired_merge = ["ADDRESS","POSTCODE","N_UNITS","WORST_EPC","RATING_MIX","LAT","LON"]
     desired_flat  = ["ADDRESS","BASE_ADDRESS","BUILDING_ID","POSTCODE",
                      "CURRENT_ENERGY_RATING","LODGEMENT_DATE","TOTAL_FLOOR_AREA","LAT","LON"]
@@ -590,7 +582,7 @@ with tab_tbl:
     st.download_button("Download current view (CSV)", data=csv_bytes,
                        file_name="blackpool_epc_view.csv", mime="text/csv")
 
-# --- Diagnostics tab (robust) ---
+# --- Diagnostics tab ---
 with tab_diag:
     st.subheader("Diagnostics")
     st.write("Raw df shape:", df.shape)
@@ -599,5 +591,8 @@ with tab_diag:
     st.write("Display df columns:", list(df_display.columns))
     if {"LAT","LON"}.issubset(df_display.columns):
         st.write("Entries with coords:", int(df_display[["LAT","LON"]].dropna().shape[0]))
-    st.write("Sample (first 10 rows of display df):")
+        dups = df_display.dropna(subset=["LAT","LON"]).groupby(["LAT","LON"]).size()
+        n_overlap = int((dups[dups > 1].sum()) if not dups.empty else 0)
+        if n_overlap:
+            st.write(f"Overlapping pins at identical coordinates: {n_overlap}. Click pins at max zoom to spiderfy.")
     st.dataframe(df_display.head(10), use_container_width=True)
