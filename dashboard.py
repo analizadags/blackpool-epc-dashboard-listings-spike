@@ -376,7 +376,7 @@ def find_freshest_streetview(lat, lon, address, postcode, api_key):
     candidates.append(f"{address}, {postcode}, Blackpool, UK")
 
     best_key = None
-       best_meta = None
+    best_meta = None
     best_used = None
 
     for loc in dict.fromkeys(candidates):
@@ -435,7 +435,7 @@ with tab_map:
 
         addr = str(row.get("ADDRESS",""))
         pc   = str(row.get("POSTCODE","")) if pd.notna(row.get("POSTCODE")) else ""
-        addr_q = quote_plus(f"{addr}, {pc}, Blackpool, UK}")
+        addr_q = quote_plus(f"{addr}, {pc}, Blackpool, UK")
         gsv_url = f"https://www.google.com/maps/search/?api=1&query={addr_q}&layer=c"
         if not addr.strip():
             gsv_url = ("https://www.google.com/maps/@?api=1&map_action=pano"
