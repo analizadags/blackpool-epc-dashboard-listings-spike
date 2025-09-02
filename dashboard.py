@@ -128,11 +128,12 @@ def make_label_building(row: pd.Series) -> str:
     addr  = str(row.get("ADDRESS",""))
     pc    = "" if pd.isna(row.get("POSTCODE")) else str(row.get("POSTCODE"))
     worst = str(row.get("WORST_EPC",""))
-    n     = int(row.get("N_UNITS",0))
-    return f"{addr}  [{pc}]  – {n} units – worst EPC {worst}"
+    shown = int(row.get("N_UNITS", 0))
+    total = int(row.get("N_UNITS_TOTAL", shown))
+    return f"{addr}  [{pc}]  – {total} total ({shown} shown) – worst EPC {worst}"
 
 # =========================================
-# Sidebar filters (plus new Display mode + spiderfy)
+# Sidebar filters (with TOTAL-units threshold)
 # =========================================
 st.sidebar.header("Filters")
 
@@ -143,7 +144,6 @@ if st.sidebar.button("🔄 Refresh data"):
 default_key = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
 api_key = st.sidebar.text_input("Google API key (Street View & optional Geocoding)", value=default_key, type="password")
 
-# Display mode (NEW) – explicit, so you can always see individual flats
 display_mode = st.sidebar.radio(
     "Display mode",
     ["Individual flats", "Merged buildings (one pin per building)"],
@@ -151,7 +151,6 @@ display_mode = st.sidebar.radio(
 )
 merge_buildings = display_mode.startswith("Merged")
 
-# Your usual filters
 flats_only    = st.sidebar.checkbox("Flats only", value=True)
 ratings_only  = st.sidebar.checkbox("Only EPC D–G", value=True)
 rating_filter = st.sidebar.multiselect("EPC Ratings (flat-level)", ["D","E","F","G"], default=["D","E","F","G"])
@@ -174,9 +173,12 @@ if "LODGEMENT_DATE" in df.columns and df["LODGEMENT_DATE"].notna().any():
 else:
     d_from = d_to = None
 
-# Min units now applies **only in merged mode** (NEW)
-min_units = st.sidebar.number_input(
-    "Minimum units per building (applies in merged mode)", min_value=0, max_value=999, value=0, step=1
+# *** NEW: threshold uses TOTAL units from the entire CSV ***
+min_units_total = st.sidebar.number_input(
+    "Minimum TOTAL flats per building (uses entire CSV)",
+    min_value=0, max_value=999, value=0, step=1,
+    help="Buildings must have at least this many flats in the whole CSV. "
+         "Flats shown may still be a subset (e.g., only low-EPC)."
 )
 
 # Building-level label filter (only when merging)
@@ -192,7 +194,17 @@ if merge_buildings:
     )
 
 # =========================================
-# Apply filters at flat level
+# Precompute TOTAL units per building from the entire CSV
+# =========================================
+counts_all = (
+    df.groupby("BUILDING_ID")["ADDRESS"]
+      .nunique()  # use nunique in case of duplicates
+      .rename("N_UNITS_TOTAL")
+      .reset_index()
+)
+
+# =========================================
+# Apply filters at flat level (df_f)
 # =========================================
 df_f = df.copy()
 
@@ -215,6 +227,11 @@ if d_from and d_to and "LODGEMENT_DATE" in df_f.columns:
     mask = df_f["LODGEMENT_DATE"].between(pd.to_datetime(d_from), pd.to_datetime(d_to))
     df_f = df_f[mask]
 
+# *** NEW: In BOTH modes, keep only flats from buildings meeting the TOTAL-units threshold ***
+if min_units_total > 0:
+    eligible_bids = counts_all[counts_all["N_UNITS_TOTAL"] >= int(min_units_total)]["BUILDING_ID"]
+    df_f = df_f[df_f["BUILDING_ID"].isin(eligible_bids)]
+
 # =========================================
 # Build display dataframe (merge or flat)
 # =========================================
@@ -225,15 +242,16 @@ if merge_buildings:
             .first()[["BUILDING_ID","BASE_ADDRESS","POSTCODE","LAT","LON"]]
             .rename(columns={"BASE_ADDRESS":"ADDRESS"})
     )
-    counts = df_f.groupby("BUILDING_ID").size().rename("N_UNITS").reset_index()
+    shown_counts = df_f.groupby("BUILDING_ID").size().rename("N_UNITS").reset_index()
     worst  = df_f.groupby("BUILDING_ID")["CURRENT_ENERGY_RATING"].apply(worst_epc).rename("WORST_EPC").reset_index()
     mix    = df_f.groupby("BUILDING_ID")["CURRENT_ENERGY_RATING"].apply(epc_mix).rename("RATING_MIX").reset_index()
 
-    df_display = base.merge(counts, on="BUILDING_ID").merge(worst, on="BUILDING_ID").merge(mix, on="BUILDING_ID")
+    df_display = base.merge(shown_counts, on="BUILDING_ID") \
+                     .merge(worst, on="BUILDING_ID") \
+                     .merge(mix, on="BUILDING_ID") \
+                     .merge(counts_all, on="BUILDING_ID", how="left")
 
-    if min_units > 0:
-        df_display = df_display[df_display["N_UNITS"] >= int(min_units)]
-
+    # Building label filter (operates on currently filtered flats df_f)
     if set(building_label_filter) != {"D","E","F","G"}:
         selected_set = set([s.upper() for s in building_label_filter])
         if building_filter_mode.startswith("Worst"):
@@ -248,8 +266,9 @@ if merge_buildings:
     df_display["__LABEL__"] = df_display.apply(make_label_building, axis=1)
 
 else:
-    # FLAT MODE: show every matching flat (no min_units filter here)
+    # FLAT MODE: show every matching flat from eligible buildings
     df_display = df_f.copy()
+    df_display = df_display.merge(counts_all, on="BUILDING_ID", how="left")
     df_display["__LABEL__"] = df_display.apply(make_label_flat, axis=1)
 
 st.caption(f"Entries shown: **{len(df_display)}**")
@@ -266,7 +285,7 @@ with st.container():
         st.metric("Entries shown", len(df_display))
     with c2:
         n_bldgs = (df_f["BUILDING_ID"].nunique() if "BUILDING_ID" in df_f.columns else 0)
-        st.metric("Unique buildings (in data)", n_bldgs)
+        st.metric("Eligible buildings (shown)", n_bldgs)
     with c3:
         with_coords = df_display[["LAT","LON"]].dropna().shape[0] if {"LAT","LON"}.issubset(df_display.columns) else 0
         st.metric("With coordinates", with_coords)
@@ -329,16 +348,17 @@ with st.sidebar:
         st.write(
             f"**{selected.get('ADDRESS','')}**\n\n"
             f"Postcode: {selected.get('POSTCODE','')}\n\n"
-            f"Units: {int(selected.get('N_UNITS',0))}\n\n"
-            f"Worst EPC: {selected.get('WORST_EPC','')}\n\n"
-            f"Mix: {selected.get('RATING_MIX','')}"
+            f"Units shown / total: {int(selected.get('N_UNITS',0))} / {int(selected.get('N_UNITS_TOTAL',selected.get('N_UNITS',0)))}\n\n"
+            f"Worst EPC (shown set): {selected.get('WORST_EPC','')}\n\n"
+            f"Mix (shown set): {selected.get('RATING_MIX','')}"
         )
     else:
         st.write(
             f"**{selected.get('ADDRESS','')}**\n\n"
             f"Postcode: {selected.get('POSTCODE','')}\n\n"
             f"EPC: {selected.get('CURRENT_ENERGY_RATING','')}\n\n"
-            f"Building: {selected.get('BUILDING_ID','')}"
+            f"Building: {selected.get('BUILDING_ID','')}\n\n"
+            f"Total units in building: {int(selected.get('N_UNITS_TOTAL',0)) if pd.notna(selected.get('N_UNITS_TOTAL')) else '—'}"
         )
     st.markdown(f"[Open in Google Maps (address-accurate)]({sel_gmaps_link})")
 
@@ -415,29 +435,26 @@ with tab_map:
         center, zoom = [53.8175, -3.05], 12
 
     m = folium.Map(location=center, zoom_start=zoom)
-    # NEW: spiderfy overlapping markers and stop clustering at high zoom
-    cluster = MarkerCluster(
-        options={
-            "spiderfyOnMaxZoom": True,
-            "showCoverageOnHover": False,
-            "zoomToBoundsOnClick": True,
-            "disableClusteringAtZoom": 19
-        }
-    ).add_to(m)
+    cluster = MarkerCluster(options={
+        "spiderfyOnMaxZoom": True,
+        "showCoverageOnHover": False,
+        "zoomToBoundsOnClick": True,
+        "disableClusteringAtZoom": 19
+    }).add_to(m)
 
-    # Count rows without coords (to explain missing pins)
     missing_coords = df_display[["LAT","LON"]].isna().any(axis=1).sum()
-
     sel_key = (selected.get("ADDRESS",""), selected.get("POSTCODE",""))
 
     for _, row in df_display.dropna(subset=["LAT","LON"]).iterrows():
         if merge_buildings:
             rating = str(row.get("WORST_EPC",""))
-            n_units = int(row.get("N_UNITS",0))
+            shown_units = int(row.get("N_UNITS",0))
+            total_units = int(row.get("N_UNITS_TOTAL", shown_units))
             mix = str(row.get("RATING_MIX",""))
         else:
             rating = str(row.get("CURRENT_ENERGY_RATING",""))
-            n_units = None
+            shown_units = None
+            total_units = int(row.get("N_UNITS_TOTAL", 0))
             mix = ""
 
         addr = str(row.get("ADDRESS",""))
@@ -445,17 +462,16 @@ with tab_map:
         addr_q = quote_plus(f"{addr}, {pc}, Blackpool, UK")
         gsv_url = f"https://www.google.com/maps/search/?api=1&query={addr_q}&layer=c"
         if not addr.strip():
-            gsv_url = (
-                "https://www.google.com/maps/@?api=1&map_action=pano"
-                f"&viewpoint={row['LAT']},{row['LON']}"
-            )
+            gsv_url = ("https://www.google.com/maps/@?api=1&map_action=pano"
+                       f"&viewpoint={row['LAT']},{row['LON']}")
 
         popup_html = (
             f"<div style='font-size:14px; line-height:1.2;'>"
             f"<strong>{addr or '(no address)'} </strong><br>"
             f"Postcode: {pc}<br>"
-            + (f"Units: {n_units}<br>" if merge_buildings else "")
-            + (f"Mix: {mix}<br>" if merge_buildings else f"EPC: {rating}<br>")
+            + (f"Units (shown/total): {shown_units} / {total_units}<br>" if merge_buildings else
+               (f"Total units in bldg: {total_units}<br>" if total_units else ""))
+            + (f"Mix (shown set): {mix}<br>" if merge_buildings else f"EPC: {rating}<br>")
             + f"<br><a href='{gsv_url}' target='_blank' rel='noopener noreferrer'>🧭 Open Street View</a>"
             f"</div>"
         )
@@ -476,7 +492,7 @@ with tab_map:
     if missing_coords:
         st.caption(f"Note: {missing_coords} row(s) have no coordinates, so they are not shown on the map.")
 
-# --- Street View tab (freshest pano) ---
+# --- Street View tab ---
 with tab_sv:
     st.subheader("Street View")
     address  = selected.get("ADDRESS","")
@@ -563,9 +579,9 @@ with tab_sv:
 # --- Table tab ---
 with tab_tbl:
     st.subheader("Results")
-    desired_merge = ["ADDRESS","POSTCODE","N_UNITS","WORST_EPC","RATING_MIX","LAT","LON"]
+    desired_merge = ["ADDRESS","POSTCODE","N_UNITS","N_UNITS_TOTAL","WORST_EPC","RATING_MIX","LAT","LON"]
     desired_flat  = ["ADDRESS","BASE_ADDRESS","BUILDING_ID","POSTCODE",
-                     "CURRENT_ENERGY_RATING","LODGEMENT_DATE","TOTAL_FLOOR_AREA","LAT","LON"]
+                     "CURRENT_ENERGY_RATING","LODGEMENT_DATE","TOTAL_FLOOR_AREA","N_UNITS_TOTAL","LAT","LON"]
     desired = desired_merge if merge_buildings else desired_flat
     available = [c for c in desired if c in df_display.columns]
 
