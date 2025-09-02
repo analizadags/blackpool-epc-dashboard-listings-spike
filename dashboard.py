@@ -133,7 +133,7 @@ def make_label_building(row: pd.Series) -> str:
     return f"{addr}  [{pc}]  – {total} total ({shown} shown) – worst EPC {worst}"
 
 # =========================================
-# Sidebar filters (with TOTAL-units threshold)
+# Sidebar filters (TOTAL-units threshold; label filter removed)
 # =========================================
 st.sidebar.header("Filters")
 
@@ -173,7 +173,7 @@ if "LODGEMENT_DATE" in df.columns and df["LODGEMENT_DATE"].notna().any():
 else:
     d_from = d_to = None
 
-# *** NEW: threshold uses TOTAL units from the entire CSV ***
+# threshold uses TOTAL units from the entire CSV
 min_units_total = st.sidebar.number_input(
     "Minimum TOTAL flats per building (uses entire CSV)",
     min_value=0, max_value=999, value=0, step=1,
@@ -181,24 +181,12 @@ min_units_total = st.sidebar.number_input(
          "Flats shown may still be a subset (e.g., only low-EPC)."
 )
 
-# Building-level label filter (only when merging)
-building_label_filter = ["D","E","F","G"]
-building_filter_mode = "Any unit has…"
-if merge_buildings:
-    st.sidebar.markdown("**Building label filter**")
-    building_label_filter = st.sidebar.multiselect(
-        "Choose building labels to show", ["D","E","F","G"], default=["D","E","F","G"]
-    )
-    building_filter_mode = st.sidebar.radio(
-        "How should buildings match?", ["Any unit has…", "Worst EPC is…"], index=0
-    )
-
 # =========================================
 # Precompute TOTAL units per building from the entire CSV
 # =========================================
 counts_all = (
     df.groupby("BUILDING_ID")["ADDRESS"]
-      .nunique()  # use nunique in case of duplicates
+      .nunique()
       .rename("N_UNITS_TOTAL")
       .reset_index()
 )
@@ -227,7 +215,7 @@ if d_from and d_to and "LODGEMENT_DATE" in df_f.columns:
     mask = df_f["LODGEMENT_DATE"].between(pd.to_datetime(d_from), pd.to_datetime(d_to))
     df_f = df_f[mask]
 
-# *** NEW: In BOTH modes, keep only flats from buildings meeting the TOTAL-units threshold ***
+# Keep only flats from buildings meeting the TOTAL-units threshold
 if min_units_total > 0:
     eligible_bids = counts_all[counts_all["N_UNITS_TOTAL"] >= int(min_units_total)]["BUILDING_ID"]
     df_f = df_f[df_f["BUILDING_ID"].isin(eligible_bids)]
@@ -250,18 +238,6 @@ if merge_buildings:
                      .merge(worst, on="BUILDING_ID") \
                      .merge(mix, on="BUILDING_ID") \
                      .merge(counts_all, on="BUILDING_ID", how="left")
-
-    # Building label filter (operates on currently filtered flats df_f)
-    if set(building_label_filter) != {"D","E","F","G"}:
-        selected_set = set([s.upper() for s in building_label_filter])
-        if building_filter_mode.startswith("Worst"):
-            df_display = df_display[df_display["WORST_EPC"].isin(selected_set)]
-        else:
-            has_sel = (
-                df_f.groupby("BUILDING_ID")["CURRENT_ENERGY_RATING"]
-                    .apply(lambda s: s.astype(str).str.upper().isin(selected_set).any())
-            )
-            df_display = df_display[df_display["BUILDING_ID"].isin(has_sel[has_sel].index)]
 
     df_display["__LABEL__"] = df_display.apply(make_label_building, axis=1)
 
@@ -400,7 +376,7 @@ def find_freshest_streetview(lat, lon, address, postcode, api_key):
     candidates.append(f"{address}, {postcode}, Blackpool, UK")
 
     best_key = None
-    best_meta = None
+       best_meta = None
     best_used = None
 
     for loc in dict.fromkeys(candidates):
@@ -459,7 +435,7 @@ with tab_map:
 
         addr = str(row.get("ADDRESS",""))
         pc   = str(row.get("POSTCODE","")) if pd.notna(row.get("POSTCODE")) else ""
-        addr_q = quote_plus(f"{addr}, {pc}, Blackpool, UK")
+        addr_q = quote_plus(f"{addr}, {pc}, Blackpool, UK}")
         gsv_url = f"https://www.google.com/maps/search/?api=1&query={addr_q}&layer=c"
         if not addr.strip():
             gsv_url = ("https://www.google.com/maps/@?api=1&map_action=pano"
