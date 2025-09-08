@@ -139,13 +139,27 @@ st_folium(m, height=600, width=1100)
 
 # ============ Table + Download ============
 st.subheader("Results")
-st.dataframe(
-    result_df[[
-        "ADDRESS", "POSTCODE",
-        "RIGHTMOVE_SEARCH", "ZOOPLA_SEARCH", "GOOGLE_MAPS",
-        "RM_BROAD", "ZP_BROAD"
-    ]],
-    use_container_width=True
+
+table_cols = [
+    "ADDRESS", "POSTCODE",
+    "RIGHTMOVE_SEARCH", "ZOOPLA_SEARCH", "GOOGLE_MAPS",
+    "RM_BROAD", "ZP_BROAD",
+]
+
+# Ensure all columns exist (even if rows list was empty)
+for c in table_cols:
+    if c not in result_df.columns:
+        result_df[c] = ""
+
+# Reindex safely for display
+safe_view = result_df.reindex(columns=table_cols, fill_value="")
+st.dataframe(safe_view, use_container_width=True)
+
+st.download_button(
+    label="Download results as CSV",
+    data=safe_view.to_csv(index=False).encode("utf-8"),
+    file_name="listings_overlay_results.csv",
+    mime="text/csv"
 )
 
 st.download_button(
