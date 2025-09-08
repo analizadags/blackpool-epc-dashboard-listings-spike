@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os
+import os, re
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -14,7 +14,6 @@ from providers.url_builders import (
     zoopla_broad_url,
 )
 
-# Load environment variables (optional)
 load_dotenv()
 
 st.set_page_config(page_title="Listings Overlay Spike", layout="wide")
@@ -22,10 +21,7 @@ st.title("Listings Overlay Spike (Rightmove / Zoopla)")
 st.caption("Safe sandbox – separate from your production dashboard")
 
 # ============ Data Input ============
-# Always load the CSV from repo root
-DATA_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "blackpool_low_epc_with_coords.csv"
-)
+DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "blackpool_low_epc_with_coords.csv")
 
 st.markdown("**Data source:** Built-in CSV (Blackpool EPC). "
             "You can still upload another CSV to override it.")
@@ -41,16 +37,42 @@ if uploaded:
 else:
     df = load_epc_csv(DATA_PATH)
 
+# ============ Repair / synthesize missing columns ============
+notes = []
+
+# UNITS_PER_BUILDING: if missing or all NaN, infer by grouping base address + postcode
+if "UNITS_PER_BUILDING" not in df.columns or df["UNITS_PER_BUILDING"].isna().all():
+    def base_addr(s: str) -> str:
+        s = str(s or "")
+        # remove flat/unit prefix like "Flat 3, " / "Apt 2, " / "Apartment 5, "
+        s = re.sub(r"^(?:Flat|Apt|Apartment)\\s*\\w+\\s*,\\s*", "", s, flags=re.I)
+        return s.strip()
+    df["__BASE_ADDR__"] = df["ADDRESS"].map(base_addr) + " | " + df["POSTCODE"].astype(str)
+    counts = df["__BASE_ADDR__"].value_counts()
+    df["UNITS_PER_BUILDING"] = df["__BASE_ADDR__"].map(counts).astype("Int64")
+    notes.append("Estimated UNITS_PER_BUILDING by grouping flats in the same building.")
+    df.drop(columns=["__BASE_ADDR__"], inplace=True, errors="ignore")
+else:
+    # ensure numeric
+    df["UNITS_PER_BUILDING"] = pd.to_numeric(df["UNITS_PER_BUILDING"], errors="coerce").astype("Int64")
+
+if "EPC_CURRENT" not in df.columns:
+    df["EPC_CURRENT"] = ""
+    notes.append("EPC_CURRENT not found; left blank.")
+if "EPC_POTENTIAL" not in df.columns:
+    df["EPC_POTENTIAL"] = ""
+    notes.append("EPC_POTENTIAL not found; left blank.")
+
+if notes:
+    st.warning(" • " + "\n• ".join(notes))
+
 # ============ Filters ============
 st.sidebar.header("Filters")
 min_units = st.sidebar.number_input("Min units per building", min_value=1, max_value=500, value=7)
-epc_filter = st.sidebar.multiselect(
-    "EPC current label",
-    options=sorted(df["EPC_CURRENT"].dropna().unique()),
-    default=None
-)
+epc_options = sorted([x for x in df["EPC_CURRENT"].dropna().unique() if str(x) != ""])
+epc_filter = st.sidebar.multiselect("EPC current label", options=epc_options, default=None)
 
-mask = (df["UNITS_PER_BUILDING"] >= min_units)
+mask = (df["UNITS_PER_BUILDING"].fillna(0) >= min_units)
 if epc_filter:
     mask &= df["EPC_CURRENT"].isin(epc_filter)
 
@@ -63,16 +85,18 @@ st.info(
 
 # ============ Build label + links ============
 rows = []
-for _, r in view.iterrows():
-    addr = str(r["ADDRESS"]).strip()
-    pc = str(r["POSTCODE"]).strip()
+# progress bar for big files
+progress = st.progress(0, text="Preparing links…")
+total = max(len(view), 1)
 
-    # Exact searches
+for i, r in enumerate(view.itertuples(index=False)):
+    addr = str(getattr(r, "ADDRESS")).strip()
+    pc   = str(getattr(r, "POSTCODE")).strip()
+
     rm_url = rightmove_search_url(addr, pc)
     zp_url = zoopla_search_url(addr, pc)
-    gmaps = generic_map_query(addr, pc)
+    gmaps  = generic_map_query(addr, pc)
 
-    # Broader street/block fallback
     street = addr.split(",")[1].strip() if "," in addr and len(addr.split(",")) > 1 else addr
     rm_broad = rightmove_broad_url(street, pc)
     zp_broad = zoopla_broad_url(street, pc)
@@ -90,8 +114,8 @@ for _, r in view.iterrows():
     rows.append({
         "ADDRESS": addr,
         "POSTCODE": pc,
-        "LAT": r.get("LAT"),
-        "LON": r.get("LON"),
+        "LAT": getattr(r, "LAT", None),
+        "LON": getattr(r, "LON", None),
         "__LABEL__": label,
         "__POPUP_HTML__": popup_html,
         "__MARKER_COLOR__": "blue",
@@ -101,6 +125,9 @@ for _, r in view.iterrows():
         "RM_BROAD": rm_broad,
         "ZP_BROAD": zp_broad,
     })
+
+    if i % 100 == 0 or i == total - 1:
+        progress.progress(int((i + 1) * 100 / total), text=f"Preparing links… {i + 1}/{total}")
 
 result_df = pd.DataFrame(rows)
 
@@ -128,6 +155,4 @@ st.download_button(
     mime="text/csv"
 )
 
-st.caption(
-    "Exact address searches open first; if nothing shows, try the ‘Broader’ street-level links."
-)
+st.caption("Exact address searches open first; if nothing shows, try the ‘Broader’ street-level links.")
