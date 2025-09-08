@@ -1,5 +1,7 @@
-streamlit
-pandas
-folium
-streamlit-folium
-requests
+streamlit>=1.37
+pandas>=2.2
+folium>=0.16
+streamlit-folium>=0.20
+rapidfuzz>=3.9
+python-dotenv>=1.0
+requests>=2.32
