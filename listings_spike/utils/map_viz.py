@@ -35,6 +35,6 @@ def draw_map(df, lat_col="LAT", lon_col="LON", label_col="__LABEL__"):
                 icon=folium.Icon(color=color, icon="home"),
             ).add_to(cluster)
         except Exception:
-            # Skip any odd rows silently
+            # Skip odd rows silently
             continue
     return m
