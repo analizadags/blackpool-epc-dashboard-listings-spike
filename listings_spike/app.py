@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from collections import Counter
+import requests  # for lightweight status checks
 
 from utils.epc_io import load_epc_csv
 from utils.map_viz import draw_map
@@ -14,6 +15,12 @@ from providers.url_builders import (
     rightmove_broad_url,
     zoopla_broad_url,
 )
+
+# Optional Zoopla (Piloterr) client; if file not present or no key, we fall back to "unknown"
+try:
+    from providers.zoopla_piloterr import PiloterrZooplaClient  # optional
+except Exception:
+    PiloterrZooplaClient = None
 
 # -------------------- Page setup --------------------
 load_dotenv()
@@ -52,7 +59,6 @@ display_mode = st.sidebar.radio(
 )
 
 # EPC quick-picks
-# (You can still switch to "Custom…" to pick any combination.)
 epc_mode = st.sidebar.radio(
     "EPC filter",
     ["Any", "Only E", "Only F", "Only G", "Only E+F+G", "Custom…"],
@@ -226,6 +232,45 @@ for _, r in view.iterrows():
 
 result_df = pd.DataFrame(rows)
 
+# -------------------- Lightweight "for sale" status helpers --------------------
+def _google_results_hint(url: str) -> str:
+    """
+    Heuristic: fetch the Google results page for our site-limited query.
+    Returns: 'hit' | 'miss' | 'unknown'
+    """
+    try:
+        r = requests.get(
+            url, timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; DemoApp/1.0)"}
+        )
+        txt = r.text.lower()
+        if "did not match any documents" in txt:
+            return "miss"
+        if "rightmove.co.uk" in txt or "zoopla.co.uk" in txt:
+            return "hit"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+def _zoopla_status_via_piloterr(q: str) -> str:
+    """
+    Uses Piloterr to check Zoopla. Needs PILOTERR_API_KEY in env/Secrets.
+    Returns: 'hit' | 'miss' | 'unknown'
+    """
+    if PiloterrZooplaClient is None:
+        return "unknown"
+    try:
+        client = PiloterrZooplaClient()
+        items = client.search(q) or []
+        return "hit" if len(items) > 0 else "miss"
+    except Exception:
+        return "unknown"
+
+def _status_badge(label: str, status: str, url: str) -> str:
+    icon = "✅" if status == "hit" else ("❌" if status == "miss" else "➖")
+    tip  = "found" if status == "hit" else ("not found" if status == "miss" else "unknown")
+    return f"**{label}:** {icon} <small>({tip})</small> · <a href='{url}' target='_blank'>open</a>"
+
 # -------------------- Tabs --------------------
 tabs = st.tabs(["Map", "Street View", "Table", "Diagnostics"])
 
@@ -245,21 +290,40 @@ with tabs[1]:
         lat, lon = sel_row.get("LAT"), sel_row.get("LON")
         has_coords = pd.notna(lat) and pd.notna(lon)
 
-        if google_api_key and has_coords:
-            img_url = (
-                "https://maps.googleapis.com/maps/api/streetview"
-                f"?size=640x400&location={lat},{lon}&key={google_api_key}"
+        # exact search URLs
+        rm_url = rightmove_search_url(addr, pc)
+        zp_url = zoopla_search_url(addr, pc)
+
+        # status checks
+        rm_status = _google_results_hint(rm_url)
+        zp_status = _zoopla_status_via_piloterr(f"{addr} {pc}")
+
+        left, right = st.columns([2, 1], vertical_alignment="top")
+        with left:
+            if google_api_key and has_coords:
+                img_url = (
+                    "https://maps.googleapis.com/maps/api/streetview"
+                    f"?size=640x400&location={lat},{lon}&key={google_api_key}"
+                )
+                st.image(img_url, caption=f"Street View near: {addr} [{pc}]")
+            elif not google_api_key:
+                st.warning(
+                    "Add a Google API key in the sidebar to see the Street View image. "
+                    "Until then, use the link below."
+                )
+                gmaps = generic_map_query(addr, pc)
+                st.markdown(f"[Open Google Maps / Street View]({gmaps})")
+            else:
+                st.info("This row has no LAT/LON, so Street View image can’t be shown. Try another property.")
+
+        with right:
+            st.markdown("### For Sale status")
+            st.markdown(_status_badge("Rightmove", rm_status, rm_url), unsafe_allow_html=True)
+            st.markdown(_status_badge("Zoopla",    zp_status, zp_url), unsafe_allow_html=True)
+            st.caption(
+                "Rightmove status uses a simple Google-results hint. "
+                "Zoopla status uses Piloterr if configured; otherwise shows unknown (➖)."
             )
-            st.image(img_url, caption=f"Street View near: {addr} [{pc}]")
-        elif not google_api_key:
-            st.warning(
-                "Add a Google API key in the sidebar to see the Street View image. "
-                "Until then, use the link below."
-            )
-            gmaps = generic_map_query(addr, pc)
-            st.markdown(f"[Open Google Maps / Street View]({gmaps})")
-        elif not has_coords:
-            st.info("This row has no LAT/LON, so Street View image can’t be shown. Try another property.")
 
 with tabs[2]:
     st.write("")
