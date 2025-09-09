@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from collections import Counter
-import requests  # for lightweight status checks
+import requests  # HTTP for metadata + lightweight checks
 
 from utils.epc_io import load_epc_csv
 from utils.map_viz import draw_map
@@ -231,17 +231,11 @@ for _, r in view.iterrows():
 
 result_df = pd.DataFrame(rows)
 
-# -------------------- Lightweight "for sale" status helpers --------------------
+# -------------------- Helpers --------------------
 def _google_results_hint(url: str) -> str:
-    """
-    Heuristic: fetch the Google results page for our site-limited query.
-    Returns: 'hit' | 'miss' | 'unknown'
-    """
+    """Heuristic: fetch the Google results page for our site-limited query."""
     try:
-        r = requests.get(
-            url, timeout=8,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; DemoApp/1.0)"}
-        )
+        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0 (DemoApp/1.0)"})
         txt = r.text.lower()
         if "did not match any documents" in txt:
             return "miss"
@@ -252,10 +246,7 @@ def _google_results_hint(url: str) -> str:
         return "unknown"
 
 def _zoopla_status_via_piloterr(q: str) -> str:
-    """
-    Uses Piloterr to check Zoopla. Needs PILOTERR_API_KEY in env/Secrets.
-    Returns: 'hit' | 'miss' | 'unknown'
-    """
+    """Uses Piloterr to check Zoopla when available."""
     if PiloterrZooplaClient is None:
         return "unknown"
     try:
@@ -269,6 +260,51 @@ def _status_badge(label: str, status: str, url: str) -> str:
     icon = "✅" if status == "hit" else ("❌" if status == "miss" else "➖")
     tip  = "found" if status == "hit" else ("not found" if status == "miss" else "unknown")
     return f"**{label}:** {icon} <small>({tip})</small> · <a href='{url}' target='_blank'>open</a>"
+
+def _streetview_best(lat: float, lon: float, key: str) -> dict:
+    """
+    Use Street View METADATA to find the best, most recent OUTDOOR pano near (lat,lon).
+    Returns dict with:
+      - static_img: URL (uses pano id)
+      - pano_link: Google Maps interactive link (uses pano id)
+      - date: capture date string if available
+      - note: fallback notes
+    """
+    if not (pd.notna(lat) and pd.notna(lon) and key):
+        return {}
+
+    base = "https://maps.googleapis.com/maps/api/streetview/metadata"
+    params = {
+        "location": f"{lat},{lon}",
+        "source": "outdoor",   # avoid indoor 2012-style imagery
+        "radius": 150,         # search up to 150m for a better pano
+        "key": key,
+    }
+    try:
+        resp = requests.get(base, params=params, timeout=6)
+        meta = resp.json() if resp.ok else {}
+    except Exception:
+        meta = {}
+
+    pano_id = (meta or {}).get("pano_id") or (meta or {}).get("panoId")
+    date = (meta or {}).get("date")
+
+    # Build URLs using pano id when available
+    if pano_id:
+        static_img = (
+            "https://maps.googleapis.com/maps/api/streetview"
+            f"?size=800x450&pano={pano_id}&key={key}"
+        )
+        pano_link = f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano_id}"
+        return {"static_img": static_img, "pano_link": pano_link, "date": date, "note": "pano_id"}
+    else:
+        # Fallback to viewpoint (may land on older imagery)
+        static_img = (
+            "https://maps.googleapis.com/maps/api/streetview"
+            f"?size=800x450&location={lat},{lon}&source=outdoor&key={key}"
+        )
+        pano_link = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
+        return {"static_img": static_img, "pano_link": pano_link, "date": date, "note": "viewpoint-fallback"}
 
 # -------------------- Tabs --------------------
 tabs = st.tabs(["Map", "Street View", "Table", "Diagnostics"])
@@ -289,44 +325,35 @@ with tabs[1]:
         lat, lon = sel_row.get("LAT"), sel_row.get("LON")
         has_coords = pd.notna(lat) and pd.notna(lon)
 
-        # exact search URLs
         rm_url = rightmove_search_url(addr, pc)
         zp_url = zoopla_search_url(addr, pc)
-
-        # status checks
         rm_status = _google_results_hint(rm_url)
         zp_status = _zoopla_status_via_piloterr(f"{addr} {pc}")
 
-        # Build Google Maps links (interactive, always "current")
         gmaps_search = generic_map_query(addr, pc)
-        gmaps_pano = (
-            f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
-            if has_coords else gmaps_search
-        )
 
         left, right = st.columns([2, 1], vertical_alignment="top")
         with left:
-            # If we have coords+key, show static image BUT make it CLICKABLE to open interactive Street View
             if google_api_key and has_coords:
-                static_img = (
-                    "https://maps.googleapis.com/maps/api/streetview"
-                    f"?size=800x450&location={lat},{lon}&key={google_api_key}"
-                )
-                # clickable image -> opens live Google Maps Street View (always up-to-date)
-                st.markdown(
-                    f"<a href='{gmaps_pano}' target='_blank'>"
-                    f"<img src='{static_img}' style='width:100%; border-radius:8px;'/>"
-                    f"</a>",
-                    unsafe_allow_html=True,
-                )
-                st.caption(f"Street View near: {addr} [{pc}] — click image to open interactive view.")
-                st.markdown(f"[Open Google Maps by address]({gmaps_search})")
+                best = _streetview_best(lat, lon, google_api_key)
+                if best:
+                    st.markdown(
+                        f"<a href='{best['pano_link']}' target='_blank'>"
+                        f"<img src='{best['static_img']}' style='width:100%; border-radius:8px;'/>"
+                        f"</a>",
+                        unsafe_allow_html=True,
+                    )
+                    cap = f"Street View near: {addr} [{pc}]"
+                    if best.get("date"):
+                        cap += f" — capture: {best['date']}"
+                    st.caption(cap)
+                else:
+                    st.warning("Couldn’t fetch Street View metadata. Opening by address instead.")
+                    st.markdown(f"[Open Google Maps / Street View]({gmaps_search})")
             else:
-                # No key or no coords -> give direct interactive link(s)
                 if not has_coords:
                     st.info("This row has no LAT/LON. Opening by address search instead.")
-                st.markdown(f"[Open interactive Street View / Google Maps]({gmaps_pano})")
-                st.markdown(f"[Open Google Maps by address]({gmaps_search})")
+                st.markdown(f"[Open Google Maps / Street View]({gmaps_search})")
 
         with right:
             st.markdown("### For Sale status")
@@ -373,7 +400,7 @@ with tabs[3]:
     st.code(", ".join(list(df.columns)[:80]), language="text")
     st.markdown("---")
     st.markdown(
-        "- Buildings are grouped by stripping a flat/unit prefix (e.g., `Flat 3,`) "
-        "and combining base address with postcode.\n"
-        "- If `UNITS_PER_BUILDING` was missing, it is estimated by counting flats per building."
+        "- Street View now uses the Metadata API with `source=outdoor` and a radius search to prefer fresh outdoor imagery.\n"
+        "- If a pano ID is found, both the static image and the clickable link use that pano (often newer).\n"
+        "- If not, it falls back to the viewpoint at the coordinates."
     )
