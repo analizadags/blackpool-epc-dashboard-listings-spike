@@ -16,6 +16,7 @@ from providers.url_builders import (
     zoopla_broad_url,
 )
 
+# Piloterr (optional). If not available or no key, we gracefully fall back.
 try:
     from providers.zoopla_piloterr import PiloterrZooplaClient
 except Exception:
@@ -24,14 +25,17 @@ except Exception:
 # -------------------- App setup --------------------
 load_dotenv()
 st.set_page_config(page_title="Blackpool Low-EPC Dashboard", layout="wide")
-st.markdown("""
+st.markdown(
+    """
 <style>
 .block-container { padding-top: 1rem; padding-bottom: 2rem; }
 .small-muted { color:#6b7280; font-size:0.9rem; }
 .stTabs [data-baseweb="tab-list"] { gap: .35rem; }
 .stTabs [data-baseweb="tab"] { padding: .3rem .6rem; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 # -------------------- Sidebar --------------------
 st.sidebar.header("Data source")
@@ -43,7 +47,8 @@ if st.sidebar.button("Refresh data"):
 st.sidebar.divider()
 st.sidebar.header("Filters")
 
-google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
+GOOGLE_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY")
+PILOTERR_KEY = st.secrets.get("PILOTERR_API_KEY")
 
 display_mode = st.sidebar.radio("Display mode",
     ["Individual flats", "Merged buildings (one pin per building)"], index=0)
@@ -141,8 +146,9 @@ for _,r in view.iterrows():
     })
 result_df=pd.DataFrame(rows)
 
-# -------------------- For-sale helpers --------------------
+# -------------------- “For sale” helpers --------------------
 def _google_results_hint(url:str)->str:
+    """Very light heuristic using a Google results page."""
     try:
         r=requests.get(url,timeout=8,headers={"User-Agent":"Mozilla/5.0 (DemoApp/1.0)"})
         t=r.text.lower()
@@ -152,21 +158,40 @@ def _google_results_hint(url:str)->str:
     except Exception:
         return "unknown"
 
-def _zoopla_status_via_piloterr(q:str)->str:
-    if PiloterrZooplaClient is None: return "unknown"
+def _zoopla_status_via_piloterr(q: str) -> str:
+    """Uses Piloterr if available; returns 'hit'/'miss'/'unknown'."""
+    if (PiloterrZooplaClient is None) or (not PILOTERR_KEY):
+        return "unknown"
     try:
-        return "hit" if (PiloterrZooplaClient().search(q) or []) else "miss"
+        client = PiloterrZooplaClient()
+        items = client.search(q) or []
+        return "hit" if len(items) > 0 else "miss"
     except Exception:
         return "unknown"
 
-def _status_badge(label:str,status:str,url:str)->str:
-    icon = "✅" if status=="hit" else ("❌" if status=="miss" else "➖")
-    tip  = "found" if status=="hit" else ("not found" if status=="miss" else "unknown")
+def _zoopla_status(addr: str, pc: str) -> tuple[str, str]:
+    """
+    Robust Zoopla check:
+      1) Try Piloterr (if configured)
+      2) If miss/unknown, fall back to Google 'site:zoopla.co.uk' search
+    Returns (status, source_note)
+    """
+    s = _zoopla_status_via_piloterr(f"{addr} {pc}")
+    if s == "hit":
+        return s, "piloterr"
+    # fallback to Google
+    g_url = zoopla_search_url(addr, pc)
+    s = _google_results_hint(g_url)
+    return s, "google"
+
+def _status_badge(label: str, status: str, url: str) -> str:
+    icon = "✅" if status == "hit" else ("❌" if status == "miss" else "➖")
+    tip  = "found" if status == "hit" else ("not found" if status == "miss" else "unknown")
     return f"**{label}:** {icon} <small>({tip})</small> · <a href='{url}' target='_blank'>open</a>"
 
 # -------------------- Geocode / Roads / Street View --------------------
 def _geocode(address_q:str,key:str):
-    """Return (place_id, lat, lon) for the address using Geocoding API."""
+    """Return (place_id, lat, lon) via Geocoding API."""
     if not (address_q and key): return (None,None,None)
     try:
         r=requests.get("https://maps.googleapis.com/maps/api/geocode/json",
@@ -181,7 +206,7 @@ def _geocode(address_q:str,key:str):
         return (None,None,None)
 
 def _snap_to_road(lat, lon, key):
-    """Snap to the nearest road centerline using Roads API (falls back on error)."""
+    """Snap to nearest road centerline using Roads API (optional)."""
     if not (pd.notna(lat) and pd.notna(lon) and key): return (None, None)
     try:
         r=requests.get("https://roads.googleapis.com/v1/nearestRoads",
@@ -230,26 +255,24 @@ def _offset(lat, lon, bearing_deg, dist_m):
 
 def _best_streetview(addr:str, pc:str, csv_lat, csv_lon, key:str)->dict:
     """
-    Global strategy (applies to all addresses):
-      1) Geocode to (place_id, geo_latlon)
-      2) Snap geo_latlon to road via Roads API → search Street View tightly at snapped point
-         (radii 25 → 45), plus small micro-ring (12m/22m) around snapped point
-      3) If none, search around raw geocoded lat/lon (micro + 35m)
+    Global strategy for ALL addresses:
+      1) Geocode → (place_id, geo_latlon)
+      2) Snap geo_latlon to road (Roads API), then very tight search at snapped point;
+         micro-search around snapped point (rings 12m/22m)
+      3) If none, micro-search around raw geocoded point
       4) If none, search place_id (50 → 120m)
       5) If none, fallback to CSV lat/lon (50 → 120 → 200m)
-    Returns {'static','link','date'} or {}.
     """
     pid, glat, glon = _geocode(f"{addr}, {pc}", key)
 
-    # (2) Snap to road (frontage on carriageway)
+    # (2) Snap to road for frontage
     if glat is not None and glon is not None:
         s_lat, s_lon = _snap_to_road(glat, glon, key)
         if s_lat is not None and s_lon is not None:
-            # try very tight at snapped point
             for r_ in (25, 45):
                 hit=_sv_meta(f"{s_lat},{s_lon}", key, r_)
-                if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date"), "note":f"snap {r_}m"}
-            # micro-ring around snapped point
+                if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date")}
+            # micro-ring
             best=None; best_d=1e12
             samples=[f"{s_lat},{s_lon}"]
             for ring in (12, 22):
@@ -260,10 +283,9 @@ def _best_streetview(addr:str, pc:str, csv_lat, csv_lon, key:str)->dict:
                 hit=_sv_meta(loc, key, 35)
                 if hit and (hit.get("lat") is not None and hit.get("lon") is not None):
                     d=_haversine(s_lat, s_lon, hit["lat"], hit["lon"])
-                    if d<best_d:
-                        best, best_d = hit, d
+                    if d<best_d: best, best_d = hit, d
             if best:
-                return {"static":best["static"], "link":best["link"], "date":best.get("date"), "note":f"snap micro d≈{int(best_d)}m"}
+                return {"static":best["static"], "link":best["link"], "date":best.get("date")}
 
     # (3) Micro-search around geocoded (building) point
     if glat is not None and glon is not None:
@@ -277,22 +299,21 @@ def _best_streetview(addr:str, pc:str, csv_lat, csv_lon, key:str)->dict:
             hit=_sv_meta(loc, key, 35)
             if hit and (hit.get("lat") is not None and hit.get("lon") is not None):
                 d=_haversine(glat, glon, hit["lat"], hit["lon"])
-                if d<best_d:
-                    best, best_d = hit, d
+                if d<best_d: best, best_d = hit, d
         if best:
-            return {"static":best["static"], "link":best["link"], "date":best.get("date"), "note":f"geo micro d≈{int(best_d)}m"}
+            return {"static":best["static"], "link":best["link"], "date":best.get("date")}
 
     # (4) place_id wider
     if pid:
         for r_ in (50, 120):
             hit=_sv_meta(f"place_id:{pid}", key, r_)
-            if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date"), "note":f"pid {r_}m"}
+            if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date")}
 
     # (5) CSV fallback
     if pd.notna(csv_lat) and pd.notna(csv_lon):
         for r_ in (50, 120, 200):
             hit=_sv_meta(f"{csv_lat},{csv_lon}", key, r_)
-            if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date"), "note":f"csv {r_}m"}
+            if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date")}
 
     return {}
 
@@ -316,14 +337,16 @@ with tabs[1]:
 
         rm_url=rightmove_search_url(addr,pc)
         zp_url=zoopla_search_url(addr,pc)
+
         rm_status=_google_results_hint(rm_url)
-        zp_status=_zoopla_status_via_piloterr(f"{addr} {pc}")
+        zp_status, zp_source=_zoopla_status(addr, pc)  # robust checker
+
         gmaps_search=generic_map_query(addr,pc)
 
         left,right=st.columns([2,1], vertical_alignment="top")
         with left:
-            if google_api_key:
-                best=_best_streetview(addr, pc, lat, lon, google_api_key)
+            if GOOGLE_KEY:
+                best=_best_streetview(addr, pc, lat, lon, GOOGLE_KEY)
                 if best:
                     st.markdown(
                         f"<a href='{best['link']}' target='_blank'>"
@@ -342,8 +365,8 @@ with tabs[1]:
         with right:
             st.markdown("### For Sale status")
             st.markdown(_status_badge("Rightmove", rm_status, rm_url), unsafe_allow_html=True)
-            st.markdown(_status_badge("Zoopla",    zp_status, zp_url), unsafe_allow_html=True)
-            st.caption("Rightmove uses a simple Google-results hint. Zoopla uses Piloterr if configured.")
+            st.markdown(_status_badge(f"Zoopla ({zp_source})", zp_status, zp_url), unsafe_allow_html=True)
+            st.caption("Rightmove uses a simple Google-results hint. Zoopla uses Piloterr when available, else Google fallback.")
 
 with tabs[2]:
     st.write("")
@@ -369,8 +392,7 @@ with tabs[3]:
     st.markdown("**Columns present**")
     st.code(", ".join(list(df.columns)[:80]), language="text")
     st.markdown("---")
-    st.markdown(
-        "- Uses Geocoding + Roads (Nearest Roads) to anchor the pin on the carriageway, "
-        "then Street View Metadata with tight radii. If none found, widens in steps and falls back gracefully.\n"
-        "- Works for **all addresses**; no per-address hacks."
-    )
+    st.markdown("**Integration checks**")
+    st.write("Google Maps key loaded:", "✅" if bool(GOOGLE_KEY) else "❌")
+    st.write("Piloterr key loaded:", "✅" if bool(PILOTERR_KEY) else "❌")
+    st.caption("Roads API is optional but improves Street View accuracy (Nearest Roads endpoint).")
