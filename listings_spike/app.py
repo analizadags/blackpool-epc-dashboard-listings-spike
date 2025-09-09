@@ -298,23 +298,36 @@ with tabs[1]:
         rm_status = _google_results_hint(rm_url)
         zp_status = _zoopla_status_via_piloterr(f"{addr} {pc}")
 
+        # Build Google Maps links (interactive, always "current")
+        gmaps_search = generic_map_query(addr, pc)
+        gmaps_pano = (
+            f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
+            if has_coords else gmaps_search
+        )
+
         left, right = st.columns([2, 1], vertical_alignment="top")
         with left:
+            # If we have coords+key, show static image BUT make it CLICKABLE to open interactive Street View
             if google_api_key and has_coords:
-                img_url = (
+                static_img = (
                     "https://maps.googleapis.com/maps/api/streetview"
-                    f"?size=640x400&location={lat},{lon}&key={google_api_key}"
+                    f"?size=800x450&location={lat},{lon}&key={google_api_key}"
                 )
-                st.image(img_url, caption=f"Street View near: {addr} [{pc}]")
-            elif not google_api_key:
-                st.warning(
-                    "Add a Google API key in the sidebar to see the Street View image. "
-                    "Until then, use the link below."
+                # clickable image -> opens live Google Maps Street View (always up-to-date)
+                st.markdown(
+                    f"<a href='{gmaps_pano}' target='_blank'>"
+                    f"<img src='{static_img}' style='width:100%; border-radius:8px;'/>"
+                    f"</a>",
+                    unsafe_allow_html=True,
                 )
-                gmaps = generic_map_query(addr, pc)
-                st.markdown(f"[Open Google Maps / Street View]({gmaps})")
+                st.caption(f"Street View near: {addr} [{pc}] — click image to open interactive view.")
+                st.markdown(f"[Open Google Maps by address]({gmaps_search})")
             else:
-                st.info("This row has no LAT/LON, so Street View image can’t be shown. Try another property.")
+                # No key or no coords -> give direct interactive link(s)
+                if not has_coords:
+                    st.info("This row has no LAT/LON. Opening by address search instead.")
+                st.markdown(f"[Open interactive Street View / Google Maps]({gmaps_pano})")
+                st.markdown(f"[Open Google Maps by address]({gmaps_search})")
 
         with right:
             st.markdown("### For Sale status")
