@@ -21,7 +21,7 @@ try:
 except Exception:
     PiloterrZooplaClient = None
 
-# -------------------- Setup --------------------
+# -------------------- App setup --------------------
 load_dotenv()
 st.set_page_config(page_title="Blackpool Low-EPC Dashboard", layout="wide")
 st.markdown("""
@@ -80,19 +80,19 @@ if "__BASE_ADDR__" not in df:
 epc_options = sorted({str(x).strip().upper() for x in df.get("EPC_CURRENT", pd.Series(dtype=str)).dropna() if str(x).strip()})
 if not epc_options: epc_options = ["A","B","C","D","E","F","G"]
 
-if epc_mode == "Any":       epc_selected = []
-elif epc_mode == "Only E":  epc_selected = ["E"]
-elif epc_mode == "Only F":  epc_selected = ["F"]
-elif epc_mode == "Only G":  epc_selected = ["G"]
-elif epc_mode == "Only E+F+G": epc_selected = ["E","F","G"]
+if epc_mode == "Any":            epc_selected = []
+elif epc_mode == "Only E":       epc_selected = ["E"]
+elif epc_mode == "Only F":       epc_selected = ["F"]
+elif epc_mode == "Only G":       epc_selected = ["G"]
+elif epc_mode == "Only E+F+G":   epc_selected = ["E","F","G"]
 else:
     epc_selected = st.sidebar.multiselect("Choose EPC ratings", epc_options, default=["E","F","G"])
 
 # -------------------- Filter --------------------
 mask = (df["UNITS_PER_BUILDING"].fillna(0) >= int(min_units))
-if epc_selected:       mask &= df["EPC_CURRENT"].astype(str).str.upper().isin(epc_selected)
-if addr_contains.strip(): mask &= df["ADDRESS"].str.contains(addr_contains.strip(), case=False, na=False)
-if pc_starts.strip():     mask &= df["POSTCODE"].astype(str).str.startswith(pc_starts.strip())
+if epc_selected:           mask &= df["EPC_CURRENT"].astype(str).str.upper().isin(epc_selected)
+if addr_contains.strip():  mask &= df["ADDRESS"].str.contains(addr_contains.strip(), case=False, na=False)
+if pc_starts.strip():      mask &= df["POSTCODE"].astype(str).str.startswith(pc_starts.strip())
 df_filt = df.loc[mask].copy()
 
 view = (df_filt.sort_values(["UNITS_PER_BUILDING","EPC_CURRENT"], ascending=[False,True])
@@ -164,8 +164,9 @@ def _status_badge(label:str,status:str,url:str)->str:
     tip  = "found" if status=="hit" else ("not found" if status=="miss" else "unknown")
     return f"**{label}:** {icon} <small>({tip})</small> · <a href='{url}' target='_blank'>open</a>"
 
-# -------------------- Geocoding + Street View (micro-search around frontage) --------------------
+# -------------------- Geocode / Roads / Street View --------------------
 def _geocode(address_q:str,key:str):
+    """Return (place_id, lat, lon) for the address using Geocoding API."""
     if not (address_q and key): return (None,None,None)
     try:
         r=requests.get("https://maps.googleapis.com/maps/api/geocode/json",
@@ -178,6 +179,38 @@ def _geocode(address_q:str,key:str):
         return (pid, loc.get("lat"), loc.get("lng"))
     except Exception:
         return (None,None,None)
+
+def _snap_to_road(lat, lon, key):
+    """Snap to the nearest road centerline using Roads API (falls back on error)."""
+    if not (pd.notna(lat) and pd.notna(lon) and key): return (None, None)
+    try:
+        r=requests.get("https://roads.googleapis.com/v1/nearestRoads",
+                       params={"points": f"{lat},{lon}", "key": key}, timeout=6)
+        js=r.json() if r.ok else {}
+        pts=(js.get("snappedPoints") or [])
+        if not pts: return (None, None)
+        loc=pts[0].get("location") or {}
+        return (loc.get("latitude"), loc.get("longitude"))
+    except Exception:
+        return (None, None)
+
+def _sv_meta(location:str,key:str,radius:int)->dict:
+    """Street View Metadata call; location can be 'place_id:...' or 'lat,lon'."""
+    try:
+        r=requests.get("https://maps.googleapis.com/maps/api/streetview/metadata",
+                       params={"location":location,"source":"outdoor","radius":radius,"key":key},
+                       timeout=6)
+        js=r.json() if r.ok else {}
+    except Exception:
+        js={}
+    pano = js.get("pano_id") or js.get("panoId")
+    if not pano: return {}
+    date = js.get("date")
+    loc  = (js.get("location") or {})
+    lat  = loc.get("lat"); lon = loc.get("lng")
+    static = f"https://maps.googleapis.com/maps/api/streetview?size=800x450&pano={pano}&key={key}"
+    link   = f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano}"
+    return {"pano":pano,"date":date,"static":static,"link":link,"lat":lat,"lon":lon}
 
 def _haversine(lat1,lon1,lat2,lon2):
     R=6371000.0
@@ -195,65 +228,71 @@ def _offset(lat, lon, bearing_deg, dist_m):
                              math.cos(dist_m/R)-math.sin(lat1)*math.sin(lat2))
     return (math.degrees(lat2), math.degrees(lon2))
 
-def _sv_meta(location:str,key:str,radius:int)->dict:
-    try:
-        r=requests.get("https://maps.googleapis.com/maps/api/streetview/metadata",
-                       params={"location":location,"source":"outdoor","radius":radius,"key":key},
-                       timeout=6)
-        js=r.json() if r.ok else {}
-    except Exception:
-        js={}
-    pano = js.get("pano_id") or js.get("panoId")
-    if not pano: return {}
-    date = js.get("date")
-    loc  = (js.get("location") or {})
-    lat  = loc.get("lat"); lon = loc.get("lng")
-    static = f"https://maps.googleapis.com/maps/api/streetview?size=800x450&pano={pano}&key={key}"
-    link   = f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano}"
-    return {"pano":pano,"date":date,"static":static,"link":link,"lat":lat,"lon":lon}
-
-def _best_streetview(addr:str, pc:str, lat, lon, key:str)->dict:
+def _best_streetview(addr:str, pc:str, csv_lat, csv_lon, key:str)->dict:
     """
-    1) Geocode address → (place_id, geo lat/lon).
-    2) Micro-search around geocoded lat/lon: rings 12m & 22m, 8 bearings each; radius 35m.
-       Pick nearest returned pano to the geocoded point.
-    3) If none, try place_id with radius 50→120m.
-    4) If none, try CSV lat/lon with 50→120→200m.
+    Global strategy (applies to all addresses):
+      1) Geocode to (place_id, geo_latlon)
+      2) Snap geo_latlon to road via Roads API → search Street View tightly at snapped point
+         (radii 25 → 45), plus small micro-ring (12m/22m) around snapped point
+      3) If none, search around raw geocoded lat/lon (micro + 35m)
+      4) If none, search place_id (50 → 120m)
+      5) If none, fallback to CSV lat/lon (50 → 120 → 200m)
+    Returns {'static','link','date'} or {}.
     """
     pid, glat, glon = _geocode(f"{addr}, {pc}", key)
 
-    # Step 2: micro-search rings around geocoded frontage
-    best = None; best_dist = 1e12
+    # (2) Snap to road (frontage on carriageway)
     if glat is not None and glon is not None:
-        samples = []
-        for ring in (12, 22):
-            for b in range(0, 360, 45):  # 8 bearings
-                slat, slon = _offset(glat, glon, b, ring)
-                samples.append(f"{slat},{slon}")
-        # include the exact geocoded point first
-        samples.insert(0, f"{glat},{glon}")
-        for loc in samples:
-            hit = _sv_meta(loc, key, radius=35)
-            if hit and (hit.get("lat") is not None and hit.get("lon") is not None):
-                d = _haversine(glat, glon, hit["lat"], hit["lon"])
-                if d < best_dist:
-                    best, best_dist = hit, d
-        if best:
-            return {"static":best["static"], "link":best["link"], "date":best.get("date"), "note":f"geo micro d≈{int(best_dist)}m"}
+        s_lat, s_lon = _snap_to_road(glat, glon, key)
+        if s_lat is not None and s_lon is not None:
+            # try very tight at snapped point
+            for r_ in (25, 45):
+                hit=_sv_meta(f"{s_lat},{s_lon}", key, r_)
+                if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date"), "note":f"snap {r_}m"}
+            # micro-ring around snapped point
+            best=None; best_d=1e12
+            samples=[f"{s_lat},{s_lon}"]
+            for ring in (12, 22):
+                for b in range(0,360,45):
+                    sl, so = _offset(s_lat, s_lon, b, ring)
+                    samples.append(f"{sl},{so}")
+            for loc in samples:
+                hit=_sv_meta(loc, key, 35)
+                if hit and (hit.get("lat") is not None and hit.get("lon") is not None):
+                    d=_haversine(s_lat, s_lon, hit["lat"], hit["lon"])
+                    if d<best_d:
+                        best, best_d = hit, d
+            if best:
+                return {"static":best["static"], "link":best["link"], "date":best.get("date"), "note":f"snap micro d≈{int(best_d)}m"}
 
-    # Step 3: place_id search (wider)
+    # (3) Micro-search around geocoded (building) point
+    if glat is not None and glon is not None:
+        samples=[f"{glat},{glon}"]
+        for ring in (12, 22):
+            for b in range(0,360,45):
+                sl, so = _offset(glat, glon, b, ring)
+                samples.append(f"{sl},{so}")
+        best=None; best_d=1e12
+        for loc in samples:
+            hit=_sv_meta(loc, key, 35)
+            if hit and (hit.get("lat") is not None and hit.get("lon") is not None):
+                d=_haversine(glat, glon, hit["lat"], hit["lon"])
+                if d<best_d:
+                    best, best_d = hit, d
+        if best:
+            return {"static":best["static"], "link":best["link"], "date":best.get("date"), "note":f"geo micro d≈{int(best_d)}m"}
+
+    # (4) place_id wider
     if pid:
         for r_ in (50, 120):
-            hit = _sv_meta(f"place_id:{pid}", key, r_)
-            if hit:
-                return {"static":hit["static"], "link":hit["link"], "date":hit.get("date"), "note":f"pid {r_}m"}
+            hit=_sv_meta(f"place_id:{pid}", key, r_)
+            if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date"), "note":f"pid {r_}m"}
 
-    # Step 4: CSV lat/lon
-    if pd.notna(lat) and pd.notna(lon):
+    # (5) CSV fallback
+    if pd.notna(csv_lat) and pd.notna(csv_lon):
         for r_ in (50, 120, 200):
-            hit = _sv_meta(f"{lat},{lon}", key, r_)
-            if hit:
-                return {"static":hit["static"], "link":hit["link"], "date":hit.get("date"), "note":f"csv {r_}m"}
+            hit=_sv_meta(f"{csv_lat},{csv_lon}", key, r_)
+            if hit: return {"static":hit["static"], "link":hit["link"], "date":hit.get("date"), "note":f"csv {r_}m"}
 
     return {}
 
@@ -331,7 +370,7 @@ with tabs[3]:
     st.code(", ".join(list(df.columns)[:80]), language="text")
     st.markdown("---")
     st.markdown(
-        "- Street View now performs a *micro-search* around the geocoded frontage (rings at 12 m & 22 m). "
-        "We pick the nearest outdoor pano to the pin to avoid snapping a few doors away. "
-        "If nothing close is found, we widen to place_id and CSV coordinate fallbacks."
+        "- Uses Geocoding + Roads (Nearest Roads) to anchor the pin on the carriageway, "
+        "then Street View Metadata with tight radii. If none found, widens in steps and falls back gracefully.\n"
+        "- Works for **all addresses**; no per-address hacks."
     )
