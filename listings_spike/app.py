@@ -317,6 +317,41 @@ def _best_streetview(addr:str, pc:str, csv_lat, csv_lon, key:str)->dict:
 
     return {}
 
+# -------------------- Piloterr usage (new) --------------------
+def _piloterr_usage() -> dict | None:
+    """
+    Try a few known Piloterr endpoints to fetch credit usage.
+    Returns a dict like {'remaining':int,'used':int,'quota':int} or None on failure.
+    """
+    if not PILOTERR_KEY:
+        return None
+    headers = {"Authorization": f"Bearer {PILOTERR_KEY}", "Accept": "application/json"}
+    endpoints = [
+        "https://api.piloterr.com/v2/usage",
+        "https://api.piloterr.com/usage",
+        "https://api.piloterr.com/v2/profile",
+    ]
+    for url in endpoints:
+        try:
+            r = requests.get(url, headers=headers, timeout=6)
+            if not r.ok:
+                continue
+            js = r.json()
+            # Try common field names
+            remaining = js.get("credits_remaining") or js.get("remaining") or js.get("creditsLeft")
+            quota     = js.get("credits_quota")     or js.get("quota")     or js.get("creditsTotal")
+            used      = js.get("credits_used")      or js.get("used")      or (quota - remaining if (quota is not None and remaining is not None) else None)
+            if remaining is not None or used is not None or quota is not None:
+                return {
+                    "remaining": remaining if isinstance(remaining, int) else None,
+                    "used": used if isinstance(used, int) else None,
+                    "quota": quota if isinstance(quota, int) else None,
+                    "source": url,
+                }
+        except Exception:
+            continue
+    return None
+
 # -------------------- Tabs --------------------
 tabs = st.tabs(["Map","Street View","Table","Diagnostics"])
 
@@ -395,4 +430,13 @@ with tabs[3]:
     st.markdown("**Integration checks**")
     st.write("Google Maps key loaded:", "✅" if bool(GOOGLE_KEY) else "❌")
     st.write("Piloterr key loaded:", "✅" if bool(PILOTERR_KEY) else "❌")
+    usage = _piloterr_usage()
+    if usage:
+        rem = usage.get("remaining"); used = usage.get("used"); quota = usage.get("quota")
+        st.write(f"Piloterr credits: {rem if rem is not None else '—'} remaining"
+                 + (f" of {quota}" if quota is not None else "")
+                 + (f" (used {used})" if used is not None else ""))
+        st.caption(f"Usage source: {usage.get('source','unknown')}")
+    else:
+        st.write("Piloterr credits: —")
     st.caption("Roads API is optional but improves Street View accuracy (Nearest Roads endpoint).")
