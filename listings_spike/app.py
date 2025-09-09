@@ -50,10 +50,8 @@ if st.sidebar.button("Refresh data"):
 st.sidebar.divider()
 st.sidebar.header("Filters")
 
-# ===== Hard-coded Google Maps API key (you asked to embed this) =====
-# NOTE: If your repo is public, anyone can see this key in code.
-# Consider moving it to Streamlit Secrets later for security.
-google_api_key = "AIzaSyACg6D_ZXy3loh03x6cUQSyfggjNEU9jT8"
+# ✅ Read Google API key from Streamlit Secrets (safer than hard-coding)
+google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
 
 display_mode = st.sidebar.radio(
     "Display mode", ["Individual flats", "Merged buildings (one pin per building)"], index=0
