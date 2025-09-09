@@ -50,7 +50,7 @@ if st.sidebar.button("Refresh data"):
 st.sidebar.divider()
 st.sidebar.header("Filters")
 
-# ✅ Google API key from Streamlit Secrets
+# ✅ Google API key from Streamlit Secrets (no hard-coding)
 google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
 
 display_mode = st.sidebar.radio(
@@ -73,6 +73,7 @@ min_units = st.sidebar.number_input(
 # -------------------- Load data --------------------
 def base_addr(s: str) -> str:
     s = str(s or "")
+    # strip flat/unit prefix e.g. "Flat 2, ..."
     return re.sub(r"^(?:Flat|Apt|Apartment)\s*\w+\s*,\s*", "", s, flags=re.I).strip()
 
 if uploaded:
@@ -229,7 +230,7 @@ for _, r in view.iterrows():
 
 result_df = pd.DataFrame(rows)
 
-# -------------------- Helpers --------------------
+# -------------------- Lightweight "for sale" status helpers --------------------
 def _google_results_hint(url: str) -> str:
     """Heuristic: fetch the Google results page for our site-limited query."""
     try:
@@ -259,8 +260,9 @@ def _status_badge(label: str, status: str, url: str) -> str:
     tip  = "found" if status == "hit" else ("not found" if status == "miss" else "unknown")
     return f"**{label}:** {icon} <small>({tip})</small> · <a href='{url}' target='_blank'>open</a>"
 
-# --- New: address → place_id (Geocoding API), to match Google Maps manual search ---
+# -------------------- NEW: Geocoding + Street View helpers --------------------
 def _geocode_place_id(address_q: str, key: str) -> str | None:
+    """Resolve address to a Google place_id (matches manual Google Maps)."""
     if not (address_q and key):
         return None
     try:
@@ -274,40 +276,53 @@ def _geocode_place_id(address_q: str, key: str) -> str | None:
         pass
     return None
 
-def _streetview_best_from_location(location: str, key: str, radius_m: int = 120) -> dict:
+def _streetview_best_try(location: str, key: str, radius_m: int) -> dict:
     """
-    Use Street View METADATA to find the best, most recent OUTDOOR pano near the location.
+    Ask Street View Metadata for the nearest OUTDOOR pano to `location`.
     `location` can be "place_id:XXXX" or "lat,lon".
-    Returns dict with: static_img, pano_link, date, note
+    Returns dict {static_img, pano_link, date, note} or {} if none.
     """
-    if not (location and key):
-        return {}
-    meta_url = "https://maps.googleapis.com/maps/api/streetview/metadata"
+    url = "https://maps.googleapis.com/maps/api/streetview/metadata"
     params = {"location": location, "source": "outdoor", "radius": radius_m, "key": key}
     try:
-        resp = requests.get(meta_url, params=params, timeout=6)
+        resp = requests.get(url, params=params, timeout=6)
         meta = resp.json() if resp.ok else {}
     except Exception:
         meta = {}
+
     pano_id = (meta or {}).get("pano_id") or (meta or {}).get("panoId")
     date = (meta or {}).get("date")
-    if pano_id:
-        static_img = (
-            "https://maps.googleapis.com/maps/api/streetview"
-            f"?size=800x450&pano={pano_id}&key={key}"
-        )
-        pano_link = f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano_id}"
-        return {"static_img": static_img, "pano_link": pano_link, "date": date, "note": "pano_id"}
-    # fallback uses given location
+    if not pano_id:
+        return {}
+
     static_img = (
         "https://maps.googleapis.com/maps/api/streetview"
-        f"?size=800x450&location={location}&source=outdoor&key={key}"
+        f"?size=800x450&pano={pano_id}&key={key}"
     )
-    if location.startswith("place_id:"):
-        pano_link = f"https://www.google.com/maps/search/?api=1&query={location}"
-    else:
-        pano_link = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={location}"
-    return {"static_img": static_img, "pano_link": pano_link, "date": date, "note": "viewpoint-fallback"}
+    pano_link = f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano_id}"
+    return {"static_img": static_img, "pano_link": pano_link, "date": date, "note": f"pano_id/r{radius_m}"}
+
+def _streetview_best(loc_place_id: str | None, lat: float | None, lon: float | None, key: str) -> dict:
+    """
+    Strategy:
+      1) place_id with tight radius (50m)
+      2) place_id with 120m
+      3) place_id with 200m
+      4) lat,lon with same radii (if available)
+    Returns first hit; otherwise {}.
+    """
+    attempts = []
+    if loc_place_id:
+        attempts += [f"place_id:{loc_place_id}"]
+    if pd.notna(lat) and pd.notna(lon):
+        attempts += [f"{lat},{lon}"]
+
+    for loc in attempts:
+        for rad in (50, 120, 200):
+            hit = _streetview_best_try(loc, key, rad)
+            if hit:
+                return hit
+    return {}
 
 # -------------------- Tabs --------------------
 tabs = st.tabs(["Map", "Street View", "Table", "Diagnostics"])
@@ -338,14 +353,9 @@ with tabs[1]:
         left, right = st.columns([2, 1], vertical_alignment="top")
         with left:
             if google_api_key:
-                # 1) Try place_id from the full address (better match to manual Google Maps)
+                # Resolve address to place_id (best chance to match manual Google Maps)
                 place_id = _geocode_place_id(f"{addr}, {pc}", google_api_key)
-                if place_id:
-                    best = _streetview_best_from_location(f"place_id:{place_id}", google_api_key, radius_m=120)
-                elif has_coords:
-                    best = _streetview_best_from_location(f"{lat},{lon}", google_api_key, radius_m=150)
-                else:
-                    best = {}
+                best = _streetview_best(place_id, lat if has_coords else None, lon if has_coords else None, google_api_key)
 
                 if best:
                     st.markdown(
@@ -362,7 +372,6 @@ with tabs[1]:
                     st.warning("Couldn’t fetch Street View. Opening by address instead.")
                     st.markdown(f"[Open Google Maps / Street View]({gmaps_search})")
             else:
-                # No key at runtime (e.g., local dev)
                 if not has_coords:
                     st.info("This row has no LAT/LON. Opening by address search instead.")
                 st.markdown(f"[Open Google Maps / Street View]({gmaps_search})")
@@ -412,8 +421,7 @@ with tabs[3]:
     st.code(", ".join(list(df.columns)[:80]), language="text")
     st.markdown("---")
     st.markdown(
-        "- Street View now prefers the address **place_id** via the Geocoding API, "
-        "then asks Street View Metadata with `source=outdoor` and a small radius. "
-        "This matches what you see when you manually search Google Maps.\n"
-        "- If place_id is unavailable, it falls back to the CSV coordinates."
+        "- Street View uses Geocoding → place_id and then Metadata with `source=outdoor`.\n"
+        "- We try radii 50m → 120m → 200m around the place, then fall back to CSV lat/lon.\n"
+        "- The preview and the link both use the pano id; capture date is shown when available."
     )
