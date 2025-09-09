@@ -50,6 +50,10 @@ st.sidebar.header("Filters")
 GOOGLE_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY")
 PILOTERR_KEY = st.secrets.get("PILOTERR_API_KEY")
 
+# Track Piloterr calls in this Streamlit session (≈ credits used)
+if "piloterr_calls" not in st.session_state:
+    st.session_state["piloterr_calls"] = 0
+
 display_mode = st.sidebar.radio("Display mode",
     ["Individual flats", "Merged buildings (one pin per building)"], index=0)
 
@@ -164,6 +168,8 @@ def _zoopla_status_via_piloterr(q: str) -> str:
         return "unknown"
     try:
         client = PiloterrZooplaClient()
+        # Count a Piloterr call in this session (≈ 1 credit)
+        st.session_state["piloterr_calls"] = st.session_state.get("piloterr_calls", 0) + 1
         items = client.search(q) or []
         return "hit" if len(items) > 0 else "miss"
     except Exception:
@@ -317,11 +323,12 @@ def _best_streetview(addr:str, pc:str, csv_lat, csv_lon, key:str)->dict:
 
     return {}
 
-# -------------------- Piloterr usage (new) --------------------
+# -------------------- Piloterr usage (best-effort + session counter) --------------------
 def _piloterr_usage() -> dict | None:
     """
     Try a few known Piloterr endpoints to fetch credit usage.
     Returns a dict like {'remaining':int,'used':int,'quota':int} or None on failure.
+    If Piloterr doesn't expose this, Diagnostics will still show session call count.
     """
     if not PILOTERR_KEY:
         return None
@@ -337,7 +344,6 @@ def _piloterr_usage() -> dict | None:
             if not r.ok:
                 continue
             js = r.json()
-            # Try common field names
             remaining = js.get("credits_remaining") or js.get("remaining") or js.get("creditsLeft")
             quota     = js.get("credits_quota")     or js.get("quota")     or js.get("creditsTotal")
             used      = js.get("credits_used")      or js.get("used")      or (quota - remaining if (quota is not None and remaining is not None) else None)
@@ -438,5 +444,6 @@ with tabs[3]:
                  + (f" (used {used})" if used is not None else ""))
         st.caption(f"Usage source: {usage.get('source','unknown')}")
     else:
-        st.write("Piloterr credits: —")
-    st.caption("Roads API is optional but improves Street View accuracy (Nearest Roads endpoint).")
+        st.write("Piloterr credits (from API): —")
+    st.write(f"Piloterr calls **this session**: {st.session_state.get('piloterr_calls', 0)}  _(each call typically consumes 1 credit)_")
+    st.caption("Official remaining credits are visible in Piloterr → API → API usage. Session count resets on page refresh.")
