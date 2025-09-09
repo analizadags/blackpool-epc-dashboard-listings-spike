@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from collections import Counter
-import requests  # HTTP for metadata + lightweight checks
+import requests  # HTTP for geocoding, streetview metadata, lightweight checks
 
 from utils.epc_io import load_epc_csv
 from utils.map_viz import draw_map
@@ -50,7 +50,7 @@ if st.sidebar.button("Refresh data"):
 st.sidebar.divider()
 st.sidebar.header("Filters")
 
-# ✅ Read Google API key from Streamlit Secrets (safer than hard-coding)
+# ✅ Google API key from Streamlit Secrets
 google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
 
 display_mode = st.sidebar.radio(
@@ -73,7 +73,6 @@ min_units = st.sidebar.number_input(
 # -------------------- Load data --------------------
 def base_addr(s: str) -> str:
     s = str(s or "")
-    # remove flat/unit prefix like "Flat 3, " / "Apt 2, " / "Apartment 5, "
     return re.sub(r"^(?:Flat|Apt|Apartment)\s*\w+\s*,\s*", "", s, flags=re.I).strip()
 
 if uploaded:
@@ -137,7 +136,6 @@ df_filt = df.loc[mask].copy()
 
 # Merged vs individual
 if display_mode.startswith("Merged"):
-    # One row per building (choose a representative row per __BASE_ADDR__)
     view = (
         df_filt.sort_values(["UNITS_PER_BUILDING", "EPC_CURRENT"], ascending=[False, True])
         .groupby("__BASE_ADDR__", as_index=False)
@@ -261,35 +259,38 @@ def _status_badge(label: str, status: str, url: str) -> str:
     tip  = "found" if status == "hit" else ("not found" if status == "miss" else "unknown")
     return f"**{label}:** {icon} <small>({tip})</small> · <a href='{url}' target='_blank'>open</a>"
 
-def _streetview_best(lat: float, lon: float, key: str) -> dict:
-    """
-    Use Street View METADATA to find the best, most recent OUTDOOR pano near (lat,lon).
-    Returns dict with:
-      - static_img: URL (uses pano id)
-      - pano_link: Google Maps interactive link (uses pano id)
-      - date: capture date string if available
-      - note: fallback notes
-    """
-    if not (pd.notna(lat) and pd.notna(lon) and key):
-        return {}
-
-    base = "https://maps.googleapis.com/maps/api/streetview/metadata"
-    params = {
-        "location": f"{lat},{lon}",
-        "source": "outdoor",   # avoid indoor 2012-style imagery
-        "radius": 150,         # search up to 150m for a better pano
-        "key": key,
-    }
+# --- New: address → place_id (Geocoding API), to match Google Maps manual search ---
+def _geocode_place_id(address_q: str, key: str) -> str | None:
+    if not (address_q and key):
+        return None
     try:
-        resp = requests.get(base, params=params, timeout=6)
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        r = requests.get(url, params={"address": address_q, "key": key}, timeout=6)
+        js = r.json() if r.ok else {}
+        results = js.get("results") or []
+        if results:
+            return results[0].get("place_id")
+    except Exception:
+        pass
+    return None
+
+def _streetview_best_from_location(location: str, key: str, radius_m: int = 120) -> dict:
+    """
+    Use Street View METADATA to find the best, most recent OUTDOOR pano near the location.
+    `location` can be "place_id:XXXX" or "lat,lon".
+    Returns dict with: static_img, pano_link, date, note
+    """
+    if not (location and key):
+        return {}
+    meta_url = "https://maps.googleapis.com/maps/api/streetview/metadata"
+    params = {"location": location, "source": "outdoor", "radius": radius_m, "key": key}
+    try:
+        resp = requests.get(meta_url, params=params, timeout=6)
         meta = resp.json() if resp.ok else {}
     except Exception:
         meta = {}
-
     pano_id = (meta or {}).get("pano_id") or (meta or {}).get("panoId")
     date = (meta or {}).get("date")
-
-    # Build URLs using pano id when available
     if pano_id:
         static_img = (
             "https://maps.googleapis.com/maps/api/streetview"
@@ -297,14 +298,16 @@ def _streetview_best(lat: float, lon: float, key: str) -> dict:
         )
         pano_link = f"https://www.google.com/maps/@?api=1&map_action=pano&pano={pano_id}"
         return {"static_img": static_img, "pano_link": pano_link, "date": date, "note": "pano_id"}
+    # fallback uses given location
+    static_img = (
+        "https://maps.googleapis.com/maps/api/streetview"
+        f"?size=800x450&location={location}&source=outdoor&key={key}"
+    )
+    if location.startswith("place_id:"):
+        pano_link = f"https://www.google.com/maps/search/?api=1&query={location}"
     else:
-        # Fallback to viewpoint (may land on older imagery)
-        static_img = (
-            "https://maps.googleapis.com/maps/api/streetview"
-            f"?size=800x450&location={lat},{lon}&source=outdoor&key={key}"
-        )
-        pano_link = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
-        return {"static_img": static_img, "pano_link": pano_link, "date": date, "note": "viewpoint-fallback"}
+        pano_link = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={location}"
+    return {"static_img": static_img, "pano_link": pano_link, "date": date, "note": "viewpoint-fallback"}
 
 # -------------------- Tabs --------------------
 tabs = st.tabs(["Map", "Street View", "Table", "Diagnostics"])
@@ -334,8 +337,16 @@ with tabs[1]:
 
         left, right = st.columns([2, 1], vertical_alignment="top")
         with left:
-            if google_api_key and has_coords:
-                best = _streetview_best(lat, lon, google_api_key)
+            if google_api_key:
+                # 1) Try place_id from the full address (better match to manual Google Maps)
+                place_id = _geocode_place_id(f"{addr}, {pc}", google_api_key)
+                if place_id:
+                    best = _streetview_best_from_location(f"place_id:{place_id}", google_api_key, radius_m=120)
+                elif has_coords:
+                    best = _streetview_best_from_location(f"{lat},{lon}", google_api_key, radius_m=150)
+                else:
+                    best = {}
+
                 if best:
                     st.markdown(
                         f"<a href='{best['pano_link']}' target='_blank'>"
@@ -348,9 +359,10 @@ with tabs[1]:
                         cap += f" — capture: {best['date']}"
                     st.caption(cap)
                 else:
-                    st.warning("Couldn’t fetch Street View metadata. Opening by address instead.")
+                    st.warning("Couldn’t fetch Street View. Opening by address instead.")
                     st.markdown(f"[Open Google Maps / Street View]({gmaps_search})")
             else:
+                # No key at runtime (e.g., local dev)
                 if not has_coords:
                     st.info("This row has no LAT/LON. Opening by address search instead.")
                 st.markdown(f"[Open Google Maps / Street View]({gmaps_search})")
@@ -400,7 +412,8 @@ with tabs[3]:
     st.code(", ".join(list(df.columns)[:80]), language="text")
     st.markdown("---")
     st.markdown(
-        "- Street View now uses the Metadata API with `source=outdoor` and a radius search to prefer fresh outdoor imagery.\n"
-        "- If a pano ID is found, both the static image and the clickable link use that pano (often newer).\n"
-        "- If not, it falls back to the viewpoint at the coordinates."
+        "- Street View now prefers the address **place_id** via the Geocoding API, "
+        "then asks Street View Metadata with `source=outdoor` and a small radius. "
+        "This matches what you see when you manually search Google Maps.\n"
+        "- If place_id is unavailable, it falls back to the CSV coordinates."
     )
